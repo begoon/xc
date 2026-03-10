@@ -33,7 +33,7 @@ func (t *TarFS) Enter(header []byte, filename string) (VFS, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	var reader io.Reader = f
 	lower := strings.ToLower(filename)
@@ -42,7 +42,7 @@ func (t *TarFS) Enter(header []byte, filename string) (VFS, error) {
 		if err != nil {
 			return nil, err
 		}
-		defer gz.Close()
+		defer func() { _ = gz.Close() }()
 		reader = gz
 	} else if strings.HasSuffix(lower, ".bz2") || strings.HasSuffix(lower, ".tbz2") {
 		reader = bzip2.NewReader(f)
@@ -116,6 +116,10 @@ func (t *TarFS) ReadFile(path string) (io.ReadCloser, error) {
 
 func (t *TarFS) WriteFile(path string, r io.Reader) error {
 	return fmt.Errorf("writing to tar archives not supported")
+}
+
+func (t *TarFS) MkdirAll(path string) error {
+	return fmt.Errorf("creating directories in tar archives not supported")
 }
 
 func (t *TarFS) Leave() error {

@@ -33,7 +33,7 @@ func (g *GCSFS) Enter(header []byte, filename string) (VFS, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	var bucket, key string
 	scanner := bufio.NewScanner(f)
@@ -59,7 +59,7 @@ func (g *GCSFS) Enter(header []byte, filename string) (VFS, error) {
 	ctx := context.Background()
 	var opts []option.ClientOption
 	if key != "" {
-		opts = append(opts, option.WithCredentialsFile(key))
+		opts = append(opts, option.WithCredentialsFile(key)) //nolint:staticcheck // no replacement available yet
 	}
 
 	client, err := storage.NewClient(ctx, opts...)
@@ -133,15 +133,19 @@ func (g *GCSFS) WriteFile(path string, r io.Reader) error {
 	ctx := context.Background()
 	w := g.client.Bucket(g.bucket).Object(path).NewWriter(ctx)
 	if _, err := io.Copy(w, r); err != nil {
-		w.Close()
+		_ = w.Close()
 		return err
 	}
 	return w.Close()
 }
 
+func (g *GCSFS) MkdirAll(path string) error {
+	return nil // directories are implicit in GCS
+}
+
 func (g *GCSFS) Leave() error {
 	if g.client != nil {
-		g.client.Close()
+		_ = g.client.Close()
 		g.client = nil
 	}
 	return nil

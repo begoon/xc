@@ -40,7 +40,7 @@ func (fs *LocalFS) ReadDir(path string) ([]File, error) {
 			ft = TypeDir
 		}
 
-		executable := ft == TypeFile && info.Mode()&0111 != 0
+		executable := ft == TypeFile && info.Mode()&0o111 != 0
 		f := NewFileEx(info.Name(), info.Size(), ft, info.ModTime(), executable)
 
 		if isSymlink {
@@ -72,9 +72,13 @@ func (fs *LocalFS) WriteFile(path string, r io.Reader) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	_, err = io.Copy(f, r)
 	return err
+}
+
+func (fs *LocalFS) MkdirAll(path string) error {
+	return os.MkdirAll(path, 0o755)
 }
 
 func (fs *LocalFS) Leave() error {

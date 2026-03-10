@@ -12,7 +12,7 @@ import (
 type FileType int
 
 const (
-	TypeFile    FileType = iota
+	TypeFile FileType = iota
 	TypeDir
 	TypeSymlink
 )
@@ -52,10 +52,7 @@ func (f File) Ext() string {
 	if f.fileType == TypeDir {
 		return ""
 	}
-	name := f.name
-	if strings.HasPrefix(name, ".") {
-		name = name[1:]
-	}
+	name := strings.TrimPrefix(f.name, ".")
 	return filepath.Ext(name)
 }
 
@@ -125,13 +122,14 @@ func (f File) Render(width int, dirSize int64) string {
 }
 
 func padOrTruncate(s string, width int) string {
-	if len(s) > width {
+	runes := []rune(s)
+	if len(runes) > width {
 		if width > 1 {
-			return s[:width-1] + "~"
+			return string(runes[:width-1]) + "~"
 		}
-		return s[:width]
+		return string(runes[:width])
 	}
-	return s + strings.Repeat(" ", width-len(s))
+	return s + strings.Repeat(" ", width-len(runes))
 }
 
 // VFS is the virtual file system interface.
@@ -146,6 +144,8 @@ type VFS interface {
 	ReadFile(path string) (io.ReadCloser, error)
 	// WriteFile writes content from r to the given path.
 	WriteFile(path string, r io.Reader) error
+	// MkdirAll creates a directory and all parents. No-op for cloud VFS.
+	MkdirAll(path string) error
 	// Leave exits the current VFS context.
 	Leave() error
 }

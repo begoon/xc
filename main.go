@@ -1,7 +1,11 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -9,18 +13,68 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
 	"xc/vfs"
 
 	"github.com/gdamore/tcell"
 )
 
+// xcDir returns the path to ~/.xc/, creating it if needed.
+func xcDir() string {
+	home, _ := os.UserHomeDir()
+	if home == "" {
+		home = "/"
+	}
+	dir := filepath.Join(home, ".xc")
+	_ = os.MkdirAll(dir, 0o755)
+	return dir
+}
+
+// appState is the persisted state for xc.
+type appState struct {
+	Panels      [2]string   `json:"panels"`
+	Active      int         `json:"active"`
+	CopyHistory [2][]string `json:"copy_history"`
+}
+
+func (a *App) saveState() {
+	st := appState{
+		Panels:      [2]string{a.panels[0].path, a.panels[1].path},
+		Active:      a.active,
+		CopyHistory: a.copyHistory,
+	}
+	data, err := json.MarshalIndent(st, "", "  ")
+	if err != nil {
+		slog.Error("saveState marshal", "err", err)
+		return
+	}
+	path := filepath.Join(xcDir(), "xc.json")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		slog.Error("saveState write", "err", err)
+	}
+}
+
+func loadState() *appState {
+	path := filepath.Join(xcDir(), "xc.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var st appState
+	if err := json.Unmarshal(data, &st); err != nil {
+		slog.Error("loadState", "err", err)
+		return nil
+	}
+	return &st
+}
+
 // --- Styles ---
 
 var (
-	styleDef    = tcell.StyleDefault.Background(tcell.ColorNavy).Foreground(tcell.ColorWhite)
+	styleDef    = tcell.StyleDefault.Background(tcell.ColorBlack).Foreground(tcell.ColorWhite)
 	styleDir    = styleDef.Bold(true)
 	styleCursor = tcell.StyleDefault.Background(tcell.ColorTeal).Foreground(tcell.ColorBlack)
-	styleTagged = tcell.StyleDefault.Background(tcell.ColorNavy).Foreground(tcell.ColorYellow)
+	styleTagged = tcell.StyleDefault.Background(tcell.ColorBlack).Foreground(tcell.ColorYellow)
 	styleBorder = styleDef
 	styleStatus = tcell.StyleDefault.Background(tcell.ColorTeal).Foreground(tcell.ColorBlack)
 )
@@ -57,7 +111,7 @@ func newPanel(path string, fs vfs.VFS, probes []vfs.VFS, onError func(string), o
 	return p
 }
 
-func (p *Panel) reportErr(err error) {
+func (p *Panel) reportError(err error) {
 	if err != nil {
 		slog.Error("panel error", "path", p.path, "err", err)
 		if p.onError != nil {
@@ -71,7 +125,7 @@ func (p *Panel) loadDir() {
 	p.dirSizes = nil
 	files, err := p.fs.ReadDir(p.path)
 	if err != nil {
-		p.reportErr(err)
+		p.reportError(err)
 		p.files = nil
 		return
 	}
@@ -143,7 +197,7 @@ func (p *Panel) enter() {
 		}
 		newFS, err := probe.Enter(header, fullPath)
 		if err != nil {
-			p.reportErr(err)
+			p.reportError(err)
 			return
 		}
 		p.stack = append(p.stack, vfsEntry{
@@ -168,7 +222,7 @@ func (p *Panel) goUp() {
 
 	if atRoot && len(p.stack) > 0 {
 		// Leave nested VFS, restore previous context.
-		p.fs.Leave()
+		_ = p.fs.Leave()
 		prev := p.stack[len(p.stack)-1]
 		p.stack = p.stack[:len(p.stack)-1]
 		p.fs = prev.fs
@@ -255,32 +309,59 @@ func (p *Panel) selectedFile() *vfs.File {
 	return nil
 }
 
+// --- Menu ---
+
+type MenuItem struct {
+	Key    rune
+	Label  string
+	Action func()
+}
+
+type Menu struct {
+	Name  string
+	Items []MenuItem
+}
+
 // --- App ---
 
 // App is the main application state.
 type App struct {
-	screen      tcell.Screen
-	panels      [2]*Panel
-	active      int  // 0 = left, 1 = right
-	escMode     bool // true after ESC pressed, next key is treated as Meta
-	cmdMode     bool // true when command line is focused
-	cmdLine     []rune
-	cmdCursor   int
-	searchMode  bool // true when incremental search is active
-	searchQuery []rune
-	copyMode    int    // 0=off, 1=editing source, 2=editing dest
-	copyFrom    string // locked source after phase 1
+	screen        tcell.Screen
+	panels        [2]*Panel
+	active        int  // 0 = left, 1 = right
+	escMode       bool // true after ESC pressed, next key is treated as Meta
+	cmdMode       int  // 0=off, 1=direct (;), 2=piped (:)
+	cmdLine       []rune
+	cmdCursor     int
+	searchMode    bool // true when incremental search is active
+	searchQuery   []rune
+	copyMode      int    // 0=off, 1=editing source, 2=editing dest
+	copyIsMove    bool   // true when using move (copy + delete source)
+	copyFrom      string // locked source after phase 1
 	copyEdit      []rune
 	copyCursor    int
 	copyHistory   [2][]string // [0]=source history, [1]=dest history
 	copyHistIdx   int         // -1 = custom text, >=0 = selected history item
 	copyEditSaved []rune      // saved edit text before history navigation
+	menus         map[string]*Menu
+	menuActive    string // name of active menu, "" if none
+	menuCursor    int
+	menuOffset    int
+	menuStack     []menuState // stack for nested menus
+	keymaps       map[rune]func()
+	promptMode    bool
+	promptLabel   string
+	promptEdit    []rune
+	promptCursor  int
+	promptAction  func(string)
 	errMsg        string
 }
 
 var (
 	styleCmdLine = tcell.StyleDefault.Background(tcell.ColorBlack).Foreground(tcell.ColorWhite)
 	styleErr     = tcell.StyleDefault.Background(tcell.ColorBlack).Foreground(tcell.ColorRed)
+	styleMenu    = tcell.StyleDefault.Background(tcell.ColorBlack).Foreground(tcell.ColorWhite)
+	styleMenuSel = tcell.StyleDefault.Background(tcell.ColorTeal).Foreground(tcell.ColorBlack)
 )
 
 func (a *App) draw() {
@@ -296,11 +377,14 @@ func (a *App) draw() {
 	a.drawCmdLine(0, h-2, w)
 	a.drawErrLine(0, h-1, w)
 
+	if a.menuActive != "" {
+		a.drawMenu()
+	}
 	if a.copyMode > 0 {
 		a.drawCopyHistory(w, h)
 	}
 
-	if !a.cmdMode && !a.searchMode && a.copyMode == 0 {
+	if a.cmdMode == 0 && !a.searchMode && a.copyMode == 0 && !a.promptMode {
 		a.screen.HideCursor()
 	}
 }
@@ -345,9 +429,16 @@ func (a *App) drawPanel(x, y, w, h int, p *Panel, active bool) {
 				dirSize = ds
 			}
 			line := f.Render(innerW, dirSize)
+			tagged := p.tagged[f.Name()]
+			if tagged {
+				runes := []rune(line)
+				if len(runes) > 0 {
+					runes[0] = '+'
+					line = string(runes)
+				}
+			}
 
 			var style tcell.Style
-			tagged := p.tagged[f.Name()]
 			if fileIdx == p.cursor && active {
 				style = styleCursor
 			} else if tagged {
@@ -459,12 +550,26 @@ func (a *App) drawStatusLine(x, y, w int) {
 }
 
 func (a *App) drawCmdLine(x, y, w int) {
+	if a.promptMode {
+		promptW := len([]rune(a.promptLabel))
+		a.drawString(x, y, a.promptLabel, promptW, styleCmdLine)
+		editW := w - promptW
+		text := string(a.promptEdit)
+		a.drawString(x+promptW, y, text, editW, styleCmdLine)
+		a.screen.ShowCursor(x+promptW+a.promptCursor, y)
+		return
+	}
+
 	if a.copyMode > 0 {
+		verb := "Copy"
+		if a.copyIsMove {
+			verb = "Move"
+		}
 		var prompt string
 		if a.copyMode == 1 {
-			prompt = "Copy from "
+			prompt = verb + " from "
 		} else {
-			prompt = "Copy from " + a.copyFrom + " to "
+			prompt = verb + " from " + a.copyFrom + " to "
 		}
 		promptW := len([]rune(prompt))
 		a.drawString(x, y, prompt, promptW, styleCmdLine)
@@ -476,7 +581,7 @@ func (a *App) drawCmdLine(x, y, w int) {
 	}
 
 	if a.searchMode {
-		const prompt = "? "
+		const prompt = "/ "
 		const promptW = 2
 		a.drawString(x, y, prompt, promptW, styleCmdLine)
 		editW := w - promptW
@@ -486,12 +591,15 @@ func (a *App) drawCmdLine(x, y, w int) {
 		return
 	}
 
-	if !a.cmdMode {
+	if a.cmdMode == 0 {
 		a.drawString(x, y, "", w, styleCmdLine)
 		return
 	}
 
-	const prompt = "> "
+	prompt := "> "
+	if a.cmdMode == 2 {
+		prompt = "] "
+	}
 	const promptW = 2
 	a.drawString(x, y, prompt, promptW, styleCmdLine)
 	editW := w - promptW
@@ -596,8 +704,31 @@ func (a *App) handleCopyKey(ev *tcell.EventKey) {
 		} else {
 			dest := string(a.copyEdit)
 			a.addCopyHistory(1, dest)
+			isMove := a.copyIsMove
 			a.copyMode = 0
-			a.doCopy(a.copyFrom, dest)
+			p := a.panels[a.active]
+			if len(p.tagged) > 0 {
+				// Collect names first since doCopy triggers reload which clears tags.
+				var names []string
+				for _, f := range p.files {
+					if p.tagged[f.Name()] {
+						names = append(names, f.Name())
+					}
+				}
+				for _, name := range names {
+					a.doCopy(name, dest)
+				}
+				if isMove {
+					for _, name := range names {
+						a.doDelete(name)
+					}
+				}
+			} else {
+				a.doCopy(a.copyFrom, dest)
+				if isMove {
+					a.doDelete(a.copyFrom)
+				}
+			}
 		}
 		return
 	}
@@ -667,15 +798,7 @@ func (a *App) doCopy(src, dest string) {
 	srcPanel := a.panels[a.active]
 	dstPanel := a.panels[1-a.active]
 
-	// Build source path within the source VFS.
-	srcPath := src
-	if srcPanel.path != "" {
-		srcPath = srcPanel.path + "/" + src
-	}
-	// For local FS, use proper filepath.Join.
-	if _, ok := srcPanel.fs.(*vfs.LocalFS); ok {
-		srcPath = filepath.Join(srcPanel.path, src)
-	}
+	srcPath := vfsJoin(srcPanel.fs, srcPanel.path, src)
 
 	// If dest ends with "/" or is a local directory, append source filename.
 	if strings.HasSuffix(dest, "/") {
@@ -686,23 +809,565 @@ func (a *App) doCopy(src, dest string) {
 		}
 	}
 
-	slog.Info("copy", "from", srcPath, "to", dest)
-
-	in, err := srcPanel.fs.ReadFile(srcPath)
-	if err != nil {
-		a.setError(err.Error())
-		return
+	// Check if source is a directory.
+	isDir := false
+	for _, f := range srcPanel.files {
+		if f.Name() == src {
+			isDir = f.IsDir()
+			break
+		}
 	}
-	defer in.Close()
 
-	if err := dstPanel.fs.WriteFile(dest, in); err != nil {
-		a.setError(err.Error())
-		return
+	if isDir {
+		a.copyDir(srcPanel.fs, srcPath, dstPanel.fs, dest)
+	} else {
+		a.copyFile(srcPanel.fs, srcPath, dstPanel.fs, dest)
 	}
 
 	// Reload both panels.
 	a.panels[0].reload()
 	a.panels[1].reload()
+}
+
+func (a *App) copyFile(srcFS vfs.VFS, srcPath string, dstFS vfs.VFS, dstPath string) {
+	slog.Info("copy file", "from", srcPath, "to", dstPath)
+
+	in, err := srcFS.ReadFile(srcPath)
+	if err != nil {
+		a.setError(err.Error())
+		return
+	}
+	defer func() { _ = in.Close() }()
+
+	if err := dstFS.WriteFile(dstPath, in); err != nil {
+		a.setError(err.Error())
+	}
+}
+
+func (a *App) copyDir(srcFS vfs.VFS, srcPath string, dstFS vfs.VFS, dstPath string) {
+	slog.Info("copy dir", "from", srcPath, "to", dstPath)
+
+	if err := dstFS.MkdirAll(dstPath); err != nil {
+		a.setError(err.Error())
+		return
+	}
+
+	files, err := srcFS.ReadDir(srcPath)
+	if err != nil {
+		a.setError(err.Error())
+		return
+	}
+
+	for _, f := range files {
+		childSrc := vfsJoin(srcFS, srcPath, f.Name())
+		childDst := vfsJoin(dstFS, dstPath, f.Name())
+		if f.IsDir() {
+			a.copyDir(srcFS, childSrc, dstFS, childDst)
+		} else {
+			a.copyFile(srcFS, childSrc, dstFS, childDst)
+		}
+	}
+}
+
+func vfsJoin(fs vfs.VFS, base, name string) string {
+	if _, ok := fs.(*vfs.LocalFS); ok {
+		return filepath.Join(base, name)
+	}
+	if base == "" {
+		return name
+	}
+	return base + "/" + name
+}
+
+// --- Menu ---
+
+type menuState struct {
+	name   string
+	cursor int
+	offset int
+}
+
+func (a *App) AddMenu(name string, items ...any) {
+	menu := &Menu{Name: name}
+	for i := 0; i+2 < len(items); i += 3 {
+		key := []rune(items[i].(string))[0]
+		label := items[i+1].(string)
+		action := items[i+2].(func())
+		menu.Items = append(menu.Items, MenuItem{Key: key, Label: label, Action: action})
+	}
+	a.menus[name] = menu
+}
+
+func (a *App) AddKeymap(key string, action func()) {
+	a.keymaps[[]rune(key)[0]] = action
+}
+
+func (a *App) ShowMenu(name string) {
+	if a.menuActive != "" {
+		// Push current menu onto stack for nesting.
+		a.menuStack = append(a.menuStack, menuState{
+			name:   a.menuActive,
+			cursor: a.menuCursor,
+			offset: a.menuOffset,
+		})
+	}
+	a.menuActive = name
+	a.menuCursor = 0
+	a.menuOffset = 0
+}
+
+// Menu is an alias for ShowMenu, for use in menu item actions.
+func (a *App) Menu(name string) {
+	a.ShowMenu(name)
+}
+
+func (a *App) drawMenu() {
+	menu := a.menus[a.menuActive]
+	if menu == nil {
+		return
+	}
+
+	w, h := a.screen.Size()
+	panelW := w / 2
+	panelH := h - 3
+
+	panelX := 0
+	pw := panelW
+	if a.active == 1 {
+		panelX = panelW
+		pw = w - panelW
+	}
+
+	innerW := pw - 2
+	maxMenuH := 10
+	if maxMenuH > panelH-2 {
+		maxMenuH = panelH - 2
+	}
+
+	visibleH := len(menu.Items)
+	if visibleH > maxMenuH {
+		visibleH = maxMenuH
+	}
+
+	if a.menuCursor < a.menuOffset {
+		a.menuOffset = a.menuCursor
+	}
+	if a.menuCursor >= a.menuOffset+visibleH {
+		a.menuOffset = a.menuCursor - visibleH + 1
+	}
+
+	menuStartY := panelH - 1 - visibleH
+	for i := 0; i < visibleH; i++ {
+		idx := a.menuOffset + i
+		y := menuStartY + i
+		if idx >= len(menu.Items) {
+			break
+		}
+		item := menu.Items[idx]
+		line := fmt.Sprintf(" %c  %s", item.Key, item.Label)
+		style := styleMenu
+		if idx == a.menuCursor {
+			style = styleMenuSel
+		}
+		a.drawString(panelX+1, y, line, innerW, style)
+	}
+}
+
+func (a *App) popMenu() {
+	n := len(a.menuStack)
+	if n > 0 {
+		prev := a.menuStack[n-1]
+		a.menuStack = a.menuStack[:n-1]
+		a.menuActive = prev.name
+		a.menuCursor = prev.cursor
+		a.menuOffset = prev.offset
+	} else {
+		a.menuActive = ""
+	}
+}
+
+func (a *App) execMenuItem(item MenuItem) {
+	// Clear menu before action; action may open a submenu.
+	a.menuActive = ""
+	a.menuStack = nil
+	item.Action()
+}
+
+func (a *App) handleMenuKey(ev *tcell.EventKey) {
+	menu := a.menus[a.menuActive]
+	if menu == nil {
+		a.menuActive = ""
+		return
+	}
+
+	switch ev.Key() {
+	case tcell.KeyEscape:
+		a.popMenu()
+	case tcell.KeyUp:
+		if a.menuCursor > 0 {
+			a.menuCursor--
+		}
+	case tcell.KeyDown:
+		if a.menuCursor < len(menu.Items)-1 {
+			a.menuCursor++
+		}
+	case tcell.KeyEnter:
+		a.execMenuItem(menu.Items[a.menuCursor])
+	case tcell.KeyRune:
+		for _, item := range menu.Items {
+			if item.Key == ev.Rune() {
+				a.execMenuItem(item)
+				return
+			}
+		}
+	}
+}
+
+// --- Prompt ---
+
+func (a *App) showPrompt(label, initial string, action func(string)) {
+	a.promptMode = true
+	a.promptLabel = label
+	a.promptEdit = []rune(initial)
+	a.promptCursor = len(a.promptEdit)
+	a.promptAction = action
+}
+
+func (a *App) handlePromptKey(ev *tcell.EventKey) {
+	switch ev.Key() {
+	case tcell.KeyEscape:
+		a.promptMode = false
+	case tcell.KeyEnter:
+		a.promptMode = false
+		if a.promptAction != nil {
+			a.promptAction(string(a.promptEdit))
+		}
+	case tcell.KeyBackspace, tcell.KeyBackspace2:
+		if a.promptCursor > 0 {
+			a.promptEdit = append(a.promptEdit[:a.promptCursor-1], a.promptEdit[a.promptCursor:]...)
+			a.promptCursor--
+		}
+	case tcell.KeyLeft:
+		if a.promptCursor > 0 {
+			a.promptCursor--
+		}
+	case tcell.KeyRight:
+		if a.promptCursor < len(a.promptEdit) {
+			a.promptCursor++
+		}
+	case tcell.KeyCtrlA:
+		a.promptCursor = 0
+	case tcell.KeyCtrlE:
+		a.promptCursor = len(a.promptEdit)
+	case tcell.KeyCtrlU:
+		a.promptEdit = a.promptEdit[a.promptCursor:]
+		a.promptCursor = 0
+	case tcell.KeyCtrlK:
+		a.promptEdit = a.promptEdit[:a.promptCursor]
+	case tcell.KeyRune:
+		a.promptEdit = append(a.promptEdit[:a.promptCursor], append([]rune{ev.Rune()}, a.promptEdit[a.promptCursor:]...)...)
+		a.promptCursor++
+	}
+}
+
+// --- Macro Expansion ---
+
+func (a *App) expandMacro(cmd string) (string, bool) {
+	p := a.panels[a.active]
+	f := p.selectedFile()
+	background := false
+
+	var result strings.Builder
+	runes := []rune(cmd)
+	for i := 0; i < len(runes); i++ {
+		if runes[i] != '%' || i+1 >= len(runes) {
+			result.WriteRune(runes[i])
+			continue
+		}
+		i++
+		noQuote := false
+		if runes[i] == '~' && i+1 < len(runes) {
+			noQuote = true
+			i++
+		}
+		ch := runes[i]
+		var val string
+		switch ch {
+		case '&':
+			background = true
+			continue
+		case 'f': // file name
+			if f != nil {
+				val = f.Name()
+			}
+		case 'F': // file path
+			if f != nil {
+				val = p.diskPath(f.Name())
+			}
+		case 'x': // file name without extension
+			if f != nil {
+				val = f.BaseName()
+			}
+		case 'X': // file path without extension
+			if f != nil {
+				dp := p.diskPath(f.Name())
+				if dp != "" {
+					ext := filepath.Ext(dp)
+					val = dp[:len(dp)-len(ext)]
+				}
+			}
+		case 'm': // tagged file names
+			var names []string
+			for _, ff := range p.files {
+				if p.tagged[ff.Name()] {
+					names = append(names, ff.Name())
+				}
+			}
+			if noQuote {
+				val = strings.Join(names, " ")
+			} else {
+				var quoted []string
+				for _, n := range names {
+					quoted = append(quoted, shellQuote(n))
+				}
+				val = strings.Join(quoted, " ")
+			}
+			result.WriteString(val)
+			continue
+		case 'M': // tagged file paths
+			var paths []string
+			for _, ff := range p.files {
+				if p.tagged[ff.Name()] {
+					if dp := p.diskPath(ff.Name()); dp != "" {
+						paths = append(paths, dp)
+					}
+				}
+			}
+			if noQuote {
+				val = strings.Join(paths, " ")
+			} else {
+				var quoted []string
+				for _, p := range paths {
+					quoted = append(quoted, shellQuote(p))
+				}
+				val = strings.Join(quoted, " ")
+			}
+			result.WriteString(val)
+			continue
+		case 'd': // directory name
+			val = filepath.Base(p.path)
+		case 'D': // directory path
+			val = p.path
+		default:
+			result.WriteRune('%')
+			result.WriteRune(ch)
+			continue
+		}
+		if noQuote {
+			result.WriteString(val)
+		} else {
+			result.WriteString(shellQuote(val))
+		}
+	}
+	return result.String(), background
+}
+
+// --- Actions ---
+
+func (a *App) startCopyOrMove(isMove bool) {
+	p := a.panels[a.active]
+	a.copyIsMove = isMove
+	if len(p.tagged) > 0 {
+		a.copyFrom = fmt.Sprintf("%d files", len(p.tagged))
+		a.copyMode = 2
+		other := a.panels[1-a.active]
+		a.copyEdit = []rune(other.path)
+		a.copyCursor = len(a.copyEdit)
+		a.copyHistIdx = -1
+	} else if f := p.selectedFile(); f != nil && f.Name() != ".." {
+		a.copyMode = 1
+		a.copyEdit = []rune(f.Name())
+		a.copyCursor = len(a.copyEdit)
+		a.copyHistIdx = -1
+	}
+}
+
+func (a *App) Copy() {
+	a.startCopyOrMove(false)
+}
+
+func (a *App) Move() {
+	a.startCopyOrMove(true)
+}
+
+func (a *App) Remove() {
+	p := a.panels[a.active]
+	if len(p.tagged) > 0 {
+		a.showPrompt(fmt.Sprintf("Delete %d files? (y/n): ", len(p.tagged)), "", func(answer string) {
+			if answer != "y" {
+				return
+			}
+			var names []string
+			for _, f := range p.files {
+				if p.tagged[f.Name()] {
+					names = append(names, f.Name())
+				}
+			}
+			for _, name := range names {
+				a.doDelete(name)
+			}
+		})
+	} else if f := p.selectedFile(); f != nil && f.Name() != ".." {
+		name := f.Name()
+		a.showPrompt(fmt.Sprintf("Delete %s? (y/n): ", name), "", func(answer string) {
+			if answer != "y" {
+				return
+			}
+			a.doDelete(name)
+		})
+	}
+}
+
+func (a *App) doDelete(name string) {
+	p := a.panels[a.active]
+	dp := p.diskPath(name)
+	if dp == "" {
+		a.setError("delete not supported in virtual FS")
+		return
+	}
+	slog.Info("delete", "path", dp)
+	if err := os.RemoveAll(dp); err != nil {
+		a.setError(err.Error())
+		return
+	}
+	p.reload()
+}
+
+func (a *App) Mkdir() {
+	a.showPrompt("mkdir: ", "", func(name string) {
+		p := a.panels[a.active]
+		dp := p.diskPath(name)
+		if dp == "" {
+			if err := p.fs.MkdirAll(vfsJoin(p.fs, p.path, name)); err != nil {
+				a.setError(err.Error())
+			}
+		} else {
+			if err := os.MkdirAll(dp, 0o755); err != nil {
+				a.setError(err.Error())
+			}
+		}
+		p.reload()
+	})
+}
+
+func (a *App) Touch() {
+	a.showPrompt("new file: ", "", func(name string) {
+		p := a.panels[a.active]
+		dp := p.diskPath(name)
+		if dp == "" {
+			a.setError("new file not supported in virtual FS")
+			return
+		}
+		f, err := os.Create(dp)
+		if err != nil {
+			a.setError(err.Error())
+			return
+		}
+		_ = f.Close()
+		p.reload()
+	})
+}
+
+func (a *App) Chmod() {
+	p := a.panels[a.active]
+	f := p.selectedFile()
+	if f == nil || f.Name() == ".." {
+		return
+	}
+	dp := p.diskPath(f.Name())
+	if dp == "" {
+		a.setError("chmod not supported in virtual FS")
+		return
+	}
+	info, err := os.Stat(dp)
+	if err != nil {
+		a.setError(err.Error())
+		return
+	}
+	current := fmt.Sprintf("%04o", info.Mode().Perm())
+	a.showPrompt("chmod: ", current, func(modeStr string) {
+		var mode uint64
+		_, err := fmt.Sscanf(modeStr, "%o", &mode)
+		if err != nil {
+			a.setError("invalid mode: " + modeStr)
+			return
+		}
+		if err := os.Chmod(dp, os.FileMode(mode)); err != nil {
+			a.setError(err.Error())
+		}
+		p.reload()
+	})
+}
+
+func (a *App) Rename() {
+	p := a.panels[a.active]
+	f := p.selectedFile()
+	if f == nil || f.Name() == ".." {
+		return
+	}
+	dp := p.diskPath(f.Name())
+	if dp == "" {
+		a.setError("rename not supported in virtual FS")
+		return
+	}
+	a.showPrompt("rename to: ", f.Name(), func(newName string) {
+		newPath := filepath.Join(p.path, newName)
+		if err := os.Rename(dp, newPath); err != nil {
+			a.setError(err.Error())
+		}
+		p.reload()
+	})
+}
+
+func (a *App) Chdir(paths ...string) {
+	if len(paths) > 0 {
+		path := expandHome(paths[0])
+		p := a.panels[a.active]
+		p.path = path
+		p.cursor = 0
+		p.offset = 0
+		p.loadDir()
+	} else {
+		a.showPrompt("chdir: ", a.panels[a.active].path, func(path string) {
+			path = expandHome(path)
+			p := a.panels[a.active]
+			p.path = path
+			p.cursor = 0
+			p.offset = 0
+			p.loadDir()
+		})
+	}
+}
+
+func (a *App) Run(cmd string) {
+	expanded, background := a.expandMacro(cmd)
+	if background {
+		a.runShellCmd(expanded, true)
+	} else if isInteractiveCmd(expanded) {
+		a.runShellCmd(expanded, true)
+	} else {
+		a.runShellCmd(expanded, false)
+	}
+}
+
+func expandHome(path string) string {
+	if strings.HasPrefix(path, "~/") || path == "~" {
+		home, _ := os.UserHomeDir()
+		if home != "" {
+			return filepath.Join(home, path[1:])
+		}
+	}
+	return path
 }
 
 func (a *App) resumeScreen() {
@@ -731,6 +1396,7 @@ func (a *App) runShellCmd(cmd string, fireAndForget bool) {
 	}
 
 	slog.Info("runShellCmd", "cmd", cmd, "fireAndForget", fireAndForget)
+	a.saveState()
 	a.errMsg = ""
 	a.screen.Fini()
 
@@ -759,14 +1425,18 @@ func (a *App) execCommand() {
 		return
 	}
 
-	a.cmdMode = false
+	mode := a.cmdMode
+	a.cmdMode = 0
 	a.cmdLine = nil
 	a.cmdCursor = 0
 
-	// Commands ending with "&" or starting with interactive programs run directly.
+	// Direct mode (;): always run without piping, unless "&" suffix.
+	// Piped mode (:): run with "2>&1 | less", unless "&" or interactive cmd.
 	fireAndForget := strings.HasSuffix(cmd, "&")
 	if fireAndForget {
 		cmd = strings.TrimSpace(strings.TrimSuffix(cmd, "&"))
+	} else if mode == 1 {
+		fireAndForget = true
 	} else {
 		fireAndForget = isInteractiveCmd(cmd)
 	}
@@ -848,6 +1518,13 @@ func (a *App) handleMeta(ev *tcell.EventKey) {
 	}
 }
 
+func quoteIfNeeded(s string) string {
+	if strings.ContainsRune(s, ' ') {
+		return "\"" + s + "\""
+	}
+	return s
+}
+
 func (a *App) cmdInsertString(s string) {
 	runes := []rune(s)
 	a.cmdLine = append(a.cmdLine[:a.cmdCursor], append(runes, a.cmdLine[a.cmdCursor:]...)...)
@@ -859,7 +1536,7 @@ func (a *App) handleCmdKey(ev *tcell.EventKey) {
 
 	if ev.Key() == tcell.KeyEscape {
 		if len(a.cmdLine) == 0 {
-			a.cmdMode = false
+			a.cmdMode = 0
 			return
 		}
 		a.escMode = true
@@ -874,12 +1551,12 @@ func (a *App) handleCmdKey(ev *tcell.EventKey) {
 				var names []string
 				for _, f := range p.files {
 					if p.tagged[f.Name()] {
-						names = append(names, f.Name())
+						names = append(names, quoteIfNeeded(f.Name()))
 					}
 				}
 				a.cmdInsertString(strings.Join(names, " "))
 			} else if f := p.selectedFile(); f != nil && f.Name() != ".." {
-				a.cmdInsertString(f.Name())
+				a.cmdInsertString(quoteIfNeeded(f.Name()))
 			}
 			return
 		}
@@ -892,7 +1569,7 @@ func (a *App) handleCmdKey(ev *tcell.EventKey) {
 	case tcell.KeyTab:
 		// Insert selected filename at cursor.
 		if f := p.selectedFile(); f != nil && f.Name() != ".." {
-			a.cmdInsertString(f.Name())
+			a.cmdInsertString(quoteIfNeeded(f.Name()))
 		}
 	case tcell.KeyUp:
 		p.moveTo(p.cursor - 1)
@@ -949,8 +1626,8 @@ func (a *App) handleSearchKey(ev *tcell.EventKey) {
 		a.searchQuery = nil
 		p := a.panels[a.active]
 		if f := p.selectedFile(); f != nil && f.Name() != ".." {
-			a.cmdMode = true
-			a.cmdLine = []rune(f.Name())
+			a.cmdMode = 1
+			a.cmdLine = []rune(quoteIfNeeded(f.Name()))
 			a.cmdCursor = len(a.cmdLine)
 		}
 	case tcell.KeyBackspace, tcell.KeyBackspace2:
@@ -965,6 +1642,16 @@ func (a *App) handleSearchKey(ev *tcell.EventKey) {
 }
 
 func (a *App) handleKey(ev *tcell.EventKey) {
+	if a.menuActive != "" {
+		a.handleMenuKey(ev)
+		return
+	}
+
+	if a.promptMode {
+		a.handlePromptKey(ev)
+		return
+	}
+
 	if a.copyMode > 0 {
 		a.handleCopyKey(ev)
 		return
@@ -975,7 +1662,7 @@ func (a *App) handleKey(ev *tcell.EventKey) {
 		return
 	}
 
-	if a.cmdMode {
+	if a.cmdMode > 0 {
 		a.handleCmdKey(ev)
 		return
 	}
@@ -1049,8 +1736,14 @@ func (a *App) handleKey(ev *tcell.EventKey) {
 	case tcell.KeyCtrlL:
 		p.reload()
 	case tcell.KeyRune:
+		// Check keymaps first.
+		if action, ok := a.keymaps[ev.Rune()]; ok {
+			action()
+			return
+		}
 		switch ev.Rune() {
 		case 'q':
+			a.saveState()
 			a.screen.Fini()
 			os.Exit(0)
 		case 'k':
@@ -1065,11 +1758,7 @@ func (a *App) handleKey(ev *tcell.EventKey) {
 			p.moveTo(0)
 		case 'G':
 			p.moveTo(len(p.files) - 1)
-		case 'x':
-			a.cmdMode = true
-			a.cmdLine = nil
-			a.cmdCursor = 0
-		case 's':
+		case '/':
 			a.searchMode = true
 			a.searchQuery = nil
 		case ' ':
@@ -1077,12 +1766,11 @@ func (a *App) handleKey(ev *tcell.EventKey) {
 				if p.tagged == nil {
 					p.tagged = make(map[string]bool)
 				}
-				p.tagged[f.Name()] = true
-				p.moveTo(p.cursor + 1)
-			}
-		case '-':
-			if f := p.selectedFile(); f != nil {
-				delete(p.tagged, f.Name())
+				if p.tagged[f.Name()] {
+					delete(p.tagged, f.Name())
+				} else {
+					p.tagged[f.Name()] = true
+				}
 				p.moveTo(p.cursor + 1)
 			}
 		case 'i':
@@ -1096,13 +1784,6 @@ func (a *App) handleKey(ev *tcell.EventKey) {
 			}
 		case '_':
 			p.tagged = nil
-		case 'c':
-			if f := p.selectedFile(); f != nil && !f.IsDir() && f.Name() != ".." {
-				a.copyMode = 1
-				a.copyEdit = []rune(f.Name())
-				a.copyCursor = len(a.copyEdit)
-				a.copyHistIdx = -1
-			}
 		}
 	}
 }
@@ -1111,7 +1792,7 @@ func (a *App) handleKey(ev *tcell.EventKey) {
 
 func calcDirSize(path string) int64 {
 	var total int64
-	filepath.WalkDir(path, func(_ string, d os.DirEntry, err error) error {
+	_ = filepath.WalkDir(path, func(_ string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
@@ -1126,7 +1807,7 @@ func calcDirSize(path string) int64 {
 }
 
 // interactiveCmds are programs that manage their own terminal I/O.
-var interactiveCmds = []string{"vi", "vim", "nano", "less", "more"}
+var interactiveCmds = []string{"vi", "vim", "nano", "cot", "less", "more", "open"}
 
 func isInteractiveCmd(cmd string) bool {
 	first := strings.Fields(cmd)
@@ -1162,7 +1843,7 @@ func readHeader(path string, n int) []byte {
 	if err != nil {
 		return nil
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	buf := make([]byte, n)
 	n2, _ := f.Read(buf)
 	return buf[:n2]
@@ -1182,12 +1863,82 @@ func shortenHome(path string) string {
 
 // --- Main ---
 
-func initLogging() {
-	f, err := os.OpenFile("xc.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+type logHandler struct {
+	w      io.Writer
+	attrs  []slog.Attr
+	groups []string
+}
+
+func (h *logHandler) Enabled(_ context.Context, _ slog.Level) bool { return true }
+
+func (h *logHandler) Handle(_ context.Context, r slog.Record) error {
+	var buf strings.Builder
+	buf.WriteString(r.Time.Format("2006-01-02T15:04:05"))
+	buf.WriteByte(' ')
+	buf.WriteString(r.Level.String())
+	buf.WriteByte(' ')
+	buf.WriteString(r.Message)
+	for _, a := range h.attrs {
+		fmt.Fprintf(&buf, " %s=%s", a.Key, a.Value)
+	}
+	r.Attrs(func(a slog.Attr) bool {
+		fmt.Fprintf(&buf, " %s=%s", a.Key, a.Value)
+		return true
+	})
+	buf.WriteByte('\n')
+	_, err := io.WriteString(h.w, buf.String())
+	return err
+}
+
+func (h *logHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &logHandler{w: h.w, attrs: append(h.attrs, attrs...), groups: h.groups}
+}
+
+func (h *logHandler) WithGroup(name string) slog.Handler {
+	return &logHandler{w: h.w, attrs: h.attrs, groups: append(h.groups, name)}
+}
+
+const maxLogSize = 10 * 1024 * 1024 // 10MB
+
+func truncateLog(path string) {
+	info, err := os.Stat(path)
+	if err != nil || info.Size() <= maxLogSize {
+		return
+	}
+
+	f, err := os.Open(path)
 	if err != nil {
 		return
 	}
-	slog.SetDefault(slog.New(slog.NewTextHandler(f, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
+	// Seek to (size - maxLogSize) and read the tail.
+	offset := info.Size() - maxLogSize
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		_ = f.Close()
+		return
+	}
+	tail, err := io.ReadAll(f)
+	_ = f.Close()
+	if err != nil {
+		return
+	}
+
+	// Skip to the first complete line.
+	if idx := bytes.IndexByte(tail, '\n'); idx >= 0 {
+		tail = tail[idx+1:]
+	}
+
+	_ = os.WriteFile(path, tail, 0o644)
+}
+
+func initLogging() {
+	logPath := filepath.Join(xcDir(), "xc.log")
+	truncateLog(logPath)
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	slog.SetDefault(slog.New(&logHandler{w: f}))
 }
 
 func main() {
@@ -1218,9 +1969,31 @@ func main() {
 	localFS := &vfs.LocalFS{}
 	probes := []vfs.VFS{&vfs.TarFS{}, &vfs.GCSFS{}, &vfs.S3FS{}}
 
+	// Restore saved state.
+	saved := loadState()
+	leftDir := cwd
+	rightDir := home
+	if saved != nil {
+		if saved.Panels[0] != "" {
+			leftDir = saved.Panels[0]
+		}
+		if saved.Panels[1] != "" {
+			rightDir = saved.Panels[1]
+		}
+	}
+
 	app := &App{
-		screen: screen,
-		active: 0,
+		screen:  screen,
+		active:  0,
+		menus:   make(map[string]*Menu),
+		keymaps: make(map[rune]func()),
+	}
+
+	if saved != nil {
+		app.copyHistory = saved.CopyHistory
+		if saved.Active == 0 || saved.Active == 1 {
+			app.active = saved.Active
+		}
 	}
 
 	onExec := func(cmd string) {
@@ -1228,9 +2001,48 @@ func main() {
 	}
 
 	app.panels = [2]*Panel{
-		newPanel(cwd, localFS, probes, app.setError, onExec),
-		newPanel(home, localFS, probes, app.setError, onExec),
+		newPanel(leftDir, localFS, probes, app.setError, onExec),
+		newPanel(rightDir, localFS, probes, app.setError, onExec),
 	}
+
+	// Register menus.
+	app.AddMenu("command",
+		"c", "copy", func() { app.Copy() },
+		"m", "move", func() { app.Move() },
+		"d", "delete", func() { app.Remove() },
+		"k", "mkdir", func() { app.Mkdir() },
+		"t", "touch", func() { app.Touch() },
+		"p", "chmod", func() { app.Chmod() },
+		"r", "rename", func() { app.Rename() },
+		"g", "chdir", func() { app.Chdir() },
+	)
+
+	app.AddMenu("bookmark",
+		"h", "home", func() { app.Chdir(home) },
+		"d", "desktop", func() { app.Chdir(filepath.Join(home, "Desktop")) },
+		"w", "downloads", func() { app.Chdir(filepath.Join(home, "Downloads")) },
+		"o", "documents", func() { app.Chdir(filepath.Join(home, "Documents")) },
+	)
+
+	app.AddMenu("editor",
+		"v", "vi %F", func() { app.Run("vi %F") },
+		"c", "cot %F", func() { app.Run("cot %F") },
+		"l", "less %F", func() { app.Run("less %F") },
+		"x", "view", func() { app.Menu("view") },
+	)
+
+	app.AddMenu("view",
+		"v", "xxd", func() { app.Run("xxd -g 1 %F") },
+		"c", "cot", func() { app.Run("cot %F") },
+		"l", "less", func() { app.Run("less %F") },
+	)
+
+	// Register keymaps.
+	app.AddKeymap("x", func() { app.ShowMenu("command") })
+	app.AddKeymap("b", func() { app.ShowMenu("bookmark") })
+	app.AddKeymap("e", func() { app.ShowMenu("editor") })
+	app.AddKeymap(";", func() { app.cmdMode = 1 })
+	app.AddKeymap(":", func() { app.cmdMode = 2 })
 
 	for {
 		app.draw()

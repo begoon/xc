@@ -34,7 +34,7 @@ func (s *S3FS) Enter(header []byte, filename string) (VFS, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	var bucket, accessKey, secretKey, region string
 	scanner := bufio.NewScanner(f)
@@ -156,6 +156,10 @@ func (s *S3FS) WriteFile(path string, r io.Reader) error {
 		Body:   bytes.NewReader(data),
 	})
 	return err
+}
+
+func (s *S3FS) MkdirAll(path string) error {
+	return nil // directories are implicit in S3
 }
 
 func (s *S3FS) Leave() error {
