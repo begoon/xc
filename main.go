@@ -902,7 +902,7 @@ func (a *App) AddKeymap(key string, action func()) {
 	a.keymaps[[]rune(key)[0]] = action
 }
 
-func (a *App) ShowMenu(name string) {
+func (a *App) MenuSelector(name string) {
 	if a.menuActive != "" {
 		// Push current menu onto stack for nesting.
 		a.menuStack = append(a.menuStack, menuState{
@@ -918,7 +918,7 @@ func (a *App) ShowMenu(name string) {
 
 // Menu is an alias for ShowMenu, for use in menu item actions.
 func (a *App) Menu(name string) {
-	a.ShowMenu(name)
+	a.MenuSelector(name)
 }
 
 func (a *App) drawMenu() {
@@ -2027,20 +2027,19 @@ func main() {
 	app.AddMenu("editor",
 		"v", "vi %F", func() { app.Run("vi %F") },
 		"c", "cot %F", func() { app.Run("cot %F") },
-		"l", "less %F", func() { app.Run("less %F") },
 		"x", "view", func() { app.Menu("view") },
 	)
 
 	app.AddMenu("view",
 		"v", "xxd", func() { app.Run("xxd -g 1 %F") },
-		"c", "cot", func() { app.Run("cot %F") },
 		"l", "less", func() { app.Run("less %F") },
 	)
 
 	// Register keymaps.
-	app.AddKeymap("x", func() { app.ShowMenu("command") })
-	app.AddKeymap("b", func() { app.ShowMenu("bookmark") })
-	app.AddKeymap("e", func() { app.ShowMenu("editor") })
+	app.AddKeymap("x", func() { app.MenuSelector("command") })
+	app.AddKeymap("b", func() { app.MenuSelector("bookmark") })
+	app.AddKeymap("e", func() { app.MenuSelector("editor") })
+	app.AddKeymap("v", func() { app.MenuSelector("view") })
 	app.AddKeymap(";", func() { app.cmdMode = 1 })
 	app.AddKeymap(":", func() { app.cmdMode = 2 })
 

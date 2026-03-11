@@ -1,4 +1,6 @@
-default: check build install
+default: install-py
+
+default-go: check build install-go
 
 build:
     CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o xc main.go
@@ -16,5 +18,8 @@ check:
     golangci-lint run ./...
     errcheck ./...
 
-install:
+install-go:
     cp xc $HOME/bin/
+
+install-py:
+    cp xc.py $HOME/bin/xc
