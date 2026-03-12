@@ -2,6 +2,8 @@
 
 A two-panel console file manager inspired by Midnight Commander, written in Python.
 
+![xc](xc.png)
+
 ## Intro
 
 The Python version of xc is a single self-contained script (`xc.py`) that runs via [uv](https://docs.astral.sh/uv/). This means:
