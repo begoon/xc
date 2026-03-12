@@ -3,5 +3,6 @@
 xc
 *.gcs
 *.s3
+*.ssh
 
 __pycache__

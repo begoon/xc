@@ -23,3 +23,7 @@ install-go:
 
 install-py:
     cp xc.py $HOME/bin/xc
+
+install-vmi:
+    scp xc.py vmi:.local/bin/xc
+

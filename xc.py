@@ -18,6 +18,7 @@ import shutil
 import stat
 import subprocess
 import tarfile
+import tempfile
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -55,9 +56,7 @@ def truncate_log(path: Path) -> None:
 
 class LogFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
-        ts = datetime.fromtimestamp(record.created).strftime(
-            "%Y-%m-%dT%H:%M:%S"
-        )
+        ts = datetime.fromtimestamp(record.created).strftime("%Y-%m-%dT%H:%M:%S")
         msg = record.getMessage()
         return f"{ts} {record.levelname} {msg}"
 
@@ -217,6 +216,8 @@ def sort_files(files: list[VFile]) -> list[VFile]:
 
 
 class VFS(ABC):
+    label: str = ""
+
     @abstractmethod
     def probe(self, header: bytes, filename: str) -> bool: ...
     @abstractmethod
@@ -288,6 +289,8 @@ class LocalFS(VFS):
 
 
 class TarFS(VFS):
+    label = "TAR"
+
     def __init__(self) -> None:
         self.dirs: dict[str, list[VFile]] | None = None
 
@@ -382,6 +385,8 @@ class TarFS(VFS):
 
 
 class S3FS(VFS):
+    label = "S3"
+
     def __init__(self) -> None:
         self.client = None
         self.bucket = ""
@@ -446,9 +451,7 @@ class S3FS(VFS):
                     continue
                 mt = obj.get("LastModified")
                 ts = mt.timestamp() if mt else 0.0
-                files.append(
-                    VFile(name=name, size=obj.get("Size", 0), mod_time=ts)
-                )
+                files.append(VFile(name=name, size=obj.get("Size", 0), mod_time=ts))
         return sort_files(files)
 
     def read_file(self, path: str) -> io.IOBase:
@@ -471,6 +474,8 @@ class S3FS(VFS):
 
 
 class GCSFS(VFS):
+    label = "GCS"
+
     def __init__(self) -> None:
         self.client = None
         self.bucket_name = ""
@@ -554,6 +559,232 @@ class GCSFS(VFS):
         if self.client:
             self.client.close()
             self.client = None
+
+
+def _parse_ls_line(line: str) -> VFile | None:
+    """Parse one line of ``ls -la`` output into a VFile."""
+    # Expected format:
+    #   perms links user group size month day time_or_year name
+    # e.g. -rw-r--r--  1 user group  1234 Mar 12 10:00 file.txt
+    #      lrwxrwxrwx  1 user group    12 Mar 12 10:00 link -> target
+    parts = line.split(None, 8)
+    if len(parts) < 9:
+        return None
+
+    perms = parts[0]
+    try:
+        size = int(parts[4])
+    except ValueError:
+        size = 0
+    name_field = parts[8]
+
+    file_type = FILE_TYPE_FILE
+    link_target = ""
+    executable = False
+
+    if perms.startswith("d"):
+        file_type = FILE_TYPE_DIR
+    elif perms.startswith("l"):
+        file_type = FILE_TYPE_SYMLINK
+        if " -> " in name_field:
+            name_field, link_target = name_field.split(" -> ", 1)
+
+    if file_type == FILE_TYPE_FILE and "x" in perms[1:]:
+        executable = True
+
+    months = {
+        "Jan": 1,
+        "Feb": 2,
+        "Mar": 3,
+        "Apr": 4,
+        "May": 5,
+        "Jun": 6,
+        "Jul": 7,
+        "Aug": 8,
+        "Sep": 9,
+        "Oct": 10,
+        "Nov": 11,
+        "Dec": 12,
+    }
+    try:
+        month = months.get(parts[5], 1)
+        day = int(parts[6])
+        if ":" in parts[7]:
+            hour, minute = parts[7].split(":")
+            year = datetime.now().year
+            dt = datetime(year, month, day, int(hour), int(minute))
+        else:
+            year = int(parts[7])
+            dt = datetime(year, month, day)
+        mod_time = dt.timestamp()
+    except (ValueError, KeyError):
+        mod_time = 0.0
+
+    return VFile(
+        name=name_field,
+        size=size,
+        file_type=file_type,
+        mod_time=mod_time,
+        executable=executable,
+        link_target=link_target,
+    )
+
+
+class SSHFS(VFS):
+    """SSH virtual filesystem using the ``ssh`` executable."""
+
+    label = "SSH"
+
+    def __init__(self) -> None:
+        self.host = ""
+        self.user = ""
+        self.port = ""
+        self.identity = ""
+        self._control_path = ""
+
+    def _ssh_args(self) -> list[str]:
+        args = ["ssh"]
+        if self.port:
+            args += ["-p", self.port]
+        if self.identity:
+            args += ["-i", self.identity]
+        args += [
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            f"ControlPath={self._control_path}",
+            "-o",
+            "ControlPersist=60",
+        ]
+        target = f"{self.user}@{self.host}" if self.user else self.host
+        args.append(target)
+        return args
+
+    def _run(self, cmd: str, *, timeout: int = 30) -> str:
+        args = self._ssh_args() + [cmd]
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        if r.returncode != 0:
+            raise OSError(r.stderr.strip() or f"ssh command failed: {cmd}")
+        return r.stdout
+
+    def _run_bytes(
+        self,
+        cmd: str,
+        *,
+        timeout: int = 60,
+        stdin: bytes | None = None,
+    ) -> bytes:
+        args = self._ssh_args() + [cmd]
+        r = subprocess.run(
+            args,
+            capture_output=True,
+            input=stdin,
+            timeout=timeout,
+        )
+        if r.returncode != 0:
+            raise OSError(r.stderr.decode(errors="replace").strip())
+        return r.stdout
+
+    def probe(self, header: bytes, filename: str) -> bool:
+        if not filename.lower().endswith(".ssh"):
+            return False
+        text = header.decode(errors="ignore")
+        return "kind=ssh" in text or "host=" in text
+
+    def enter(self, header: bytes, filename: str) -> VFS:
+        host = user = port = identity = ""
+        with open(filename) as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    key, _, val = line.partition("=")
+                else:
+                    key, _, val = line.partition(" ")
+                key = key.strip().lower()
+                val = val.strip()
+                if key == "host":
+                    host = val
+                elif key == "user":
+                    user = val
+                elif key == "port":
+                    port = val
+                elif key == "identity":
+                    identity = val
+        if not host:
+            raise OSError(f"no host specified in {filename}")
+
+        fs = SSHFS()
+        fs.host = host
+        fs.user = user
+        fs.port = port
+        if identity:
+            fs.identity = os.path.expanduser(identity)
+        fs._control_path = os.path.join(
+            tempfile.gettempdir(),
+            f"xc-ssh-{user or 'default'}-{host}-{port or '22'}",
+        )
+
+        # verify connectivity
+        try:
+            fs._run("echo ok")
+        except Exception as e:
+            raise OSError(f"SSH connection to {host} failed: {e}") from e
+        return fs
+
+    def read_dir(self, path: str) -> list[VFile]:
+        remote = path if path else "."
+        q = remote.replace("'", "'\\''")
+        output = self._run(f"LANG=C ls -la '{q}'")
+        files: list[VFile] = []
+        for line in output.splitlines():
+            if line.startswith("total ") or not line.strip():
+                continue
+            vf = _parse_ls_line(line)
+            if vf and vf.name not in (".", ".."):
+                files.append(vf)
+        return sort_files(files)
+
+    def read_file(self, path: str) -> io.IOBase:
+        q = path.replace("'", "'\\''")
+        data = self._run_bytes(f"cat '{q}'")
+        return io.BytesIO(data)
+
+    def write_file(self, path: str, data: io.IOBase) -> None:
+        content = data.read()
+        if isinstance(content, str):
+            content = content.encode()
+        q = path.replace("'", "'\\''")
+        self._run_bytes(f"cat > '{q}'", stdin=content)
+
+    def mkdir_all(self, path: str) -> None:
+        q = path.replace("'", "'\\''")
+        self._run(f"mkdir -p '{q}'")
+
+    def leave(self) -> None:
+        if self._control_path:
+            try:
+                target = f"{self.user}@{self.host}" if self.user else self.host
+                subprocess.run(
+                    [
+                        "ssh",
+                        "-O",
+                        "exit",
+                        "-o",
+                        f"ControlPath={self._control_path}",
+                        target,
+                    ],
+                    capture_output=True,
+                    timeout=5,
+                )
+            except Exception:
+                pass
+        self.host = ""
 
 
 # ---------------------------------------------------------------------------
@@ -720,13 +951,20 @@ class Panel:
             return os.path.join(self.path, name)
         return ""
 
+    def vfs_path(self, name: str) -> str:
+        if self.path:
+            return self.path + "/" + name
+        return name
+
     def display_path(self) -> str:
         if not self.stack:
             return self.path
         base = self.stack[-1].entry_path
-        if not self.path:
-            return base
-        return base + "/" + self.path
+        if self.path:
+            base = base + "/" + self.path
+        if self.fs.label:
+            base = base + " (" + self.fs.label + ")"
+        return base
 
     def selected_file(self) -> VFile | None:
         if self.cursor < len(self.files):
@@ -807,7 +1045,16 @@ def expand_home(path: str) -> str:
     return path
 
 
-INTERACTIVE_CMDS = {"vi", "vim", "nano", "cot", "less", "more", "open"}
+INTERACTIVE_CMDS = {
+    "vi",
+    "vim",
+    "nano",
+    "cot",
+    "less",
+    "more",
+    "open",
+    "mcedit",
+}
 
 
 def is_interactive_cmd(cmd: str) -> bool:
@@ -912,7 +1159,7 @@ class App:
         self.cursor_pos: tuple[int, int] | None = None  # (y, x) for cursor
 
         local_fs = LocalFS()
-        probes: list[VFS] = [TarFS(), S3FS(), GCSFS()]
+        probes: list[VFS] = [TarFS(), S3FS(), GCSFS(), SSHFS()]
 
         self.panels = [
             Panel(
@@ -938,16 +1185,8 @@ class App:
 
     # -- Menus --
 
-    def add_menu(self, name: str, *items: object) -> None:
-        menu = Menu(name=name)
-        it = list(items)
-        while len(it) >= 3:
-            key, label, action = it[0], it[1], it[2]
-            it = it[3:]
-            menu.items.append(
-                MenuItem(key=str(key), label=str(label), action=action)
-            )
-        self.menus[name] = menu
+    def add_menu(self, name: str, items: list[MenuItem]) -> None:
+        self.menus[name] = Menu(name=name, items=items)
 
     def add_keymap(self, key: str, action: Callable[[], None]) -> None:
         self.keymaps[key] = action
@@ -1324,11 +1563,141 @@ class App:
             self.show_prompt("chdir: ", self.panels[self.active].path, do_it)
 
     def action_run(self, cmd: str) -> None:
-        expanded, background = self.expand_macro(cmd)
-        if background or is_interactive_cmd(expanded):
-            self.run_shell_cmd(expanded, True)
+        p = self.panels[self.active]
+        f = p.selected_file()
+        is_remote = not isinstance(p.fs, LocalFS) and f
+        uses_F = "%F" in cmd or "%~F" in cmd or "%X" in cmd or "%~X" in cmd
+
+        if is_remote and uses_F:
+            self._action_run_remote(cmd, p, f)
         else:
-            self.run_shell_cmd(expanded, False)
+            expanded, background = self.expand_macro(cmd)
+            if background or is_interactive_cmd(expanded):
+                self.run_shell_cmd(expanded, True)
+            else:
+                self.run_shell_cmd(expanded, False)
+
+    def _action_run_remote(
+        self,
+        cmd: str,
+        p: Panel,
+        f: VFile,
+    ) -> None:
+        remote_path = p.vfs_path(f.name)
+        _, ext = os.path.splitext(f.name)
+        try:
+            data = p.fs.read_file(remote_path)
+            content = data.read()
+        except Exception as e:
+            self.set_error(f"download: {e}")
+            return
+
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=ext, prefix="xc-")
+        try:
+            os.write(tmp_fd, content)
+            os.close(tmp_fd)
+            mtime_before = os.path.getmtime(tmp_path)
+
+            # expand macros with tmp_path standing in for %F
+            expanded, background = self._expand_macro_with_path(cmd, tmp_path)
+            fire = background or is_interactive_cmd(expanded)
+
+            curses.endwin()
+            user_shell = os.environ.get("SHELL", "sh")
+            if fire:
+                shell = expanded
+            else:
+                shell = f"{{ {expanded}; }} 2>&1 | less"
+            rc = subprocess.run([user_shell, "-c", shell]).returncode
+            self.scr.refresh()
+            curses.raw()
+
+            if rc == 0:
+                mtime_after = os.path.getmtime(tmp_path)
+                if mtime_after != mtime_before:
+                    with open(tmp_path, "rb") as fh:
+                        p.fs.write_file(remote_path, fh)
+            else:
+                self.set_error(f"error: exit code = {rc}")
+        except Exception as e:
+            self.set_error(str(e))
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        p.reload()
+
+    def _expand_macro_with_path(
+        self,
+        cmd: str,
+        local_path: str,
+    ) -> tuple[str, bool]:
+        """Like expand_macro but %F/%X resolve to *local_path*."""
+        p = self.panels[self.active]
+        f = p.selected_file()
+        background = False
+        result: list[str] = []
+        runes = list(cmd)
+        i = 0
+        while i < len(runes):
+            if runes[i] != "%" or i + 1 >= len(runes):
+                result.append(runes[i])
+                i += 1
+                continue
+            i += 1
+            no_quote = False
+            if runes[i] == "~" and i + 1 < len(runes):
+                no_quote = True
+                i += 1
+            ch = runes[i]
+            i += 1
+            val = ""
+            if ch == "&":
+                background = True
+                continue
+            elif ch == "f":
+                val = f.name if f else ""
+            elif ch == "F":
+                val = local_path
+            elif ch == "x":
+                val = f.base_name() if f else ""
+            elif ch == "X":
+                base, _ = os.path.splitext(local_path)
+                val = base
+            elif ch == "m":
+                names = [ff.name for ff in p.files if p.tagged.get(ff.name)]
+                if no_quote:
+                    val = " ".join(names)
+                else:
+                    val = " ".join(shell_quote(n) for n in names)
+                result.append(val)
+                continue
+            elif ch == "M":
+                paths = [
+                    p.disk_path(ff.name)
+                    for ff in p.files
+                    if p.tagged.get(ff.name) and p.disk_path(ff.name)
+                ]
+                if no_quote:
+                    val = " ".join(paths)
+                else:
+                    val = " ".join(shell_quote(pp) for pp in paths)
+                result.append(val)
+                continue
+            elif ch == "d":
+                val = os.path.basename(p.path)
+            elif ch == "D":
+                val = p.path
+            else:
+                result.append("%")
+                result.append(ch)
+                continue
+            if no_quote:
+                result.append(val)
+            else:
+                result.append(shell_quote(val))
+        return "".join(result), background
 
     # -- Shell --
 
@@ -1348,7 +1717,9 @@ class App:
             shell = f"cd {shell_quote(p.path)} && {{ {cmd}; }} 2>&1 | less"
 
         try:
-            subprocess.run([user_shell, "-c", shell])
+            rc = subprocess.run([user_shell, "-c", shell]).returncode
+            if rc != 0:
+                self.err_msg = f"error: exit code = {rc}"
         except Exception as e:
             self.err_msg = str(e)
 
@@ -1433,9 +1804,7 @@ class App:
         except curses.error:
             pass
 
-    def draw_string(
-        self, x: int, y: int, s: str, max_w: int, attr: int
-    ) -> None:
+    def draw_string(self, x: int, y: int, s: str, max_w: int, attr: int) -> None:
         runes = list(s)
         out = []
         for i in range(max_w):
@@ -1585,9 +1954,7 @@ class App:
             if i < len(counter):
                 self.set_cell(x + i, bottom_y, counter[i], attr_border)
             elif suffix and suffix_start <= i < suffix_start + len(suffix):
-                self.set_cell(
-                    x + i, bottom_y, suffix[i - suffix_start], attr_border
-                )
+                self.set_cell(x + i, bottom_y, suffix[i - suffix_start], attr_border)
             elif i == w - 1:
                 self.set_cell(x + i, bottom_y, curses.ACS_LRCORNER, attr_border)
             else:
@@ -1615,9 +1982,7 @@ class App:
                 info = os.lstat(dp)
                 mode = stat.filemode(info.st_mode)
                 nlinks = info.st_nlink
-                dt = datetime.fromtimestamp(info.st_mtime).strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                )
+                dt = datetime.fromtimestamp(info.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
                 parts.append(f"{mode} {nlinks} {info.st_size} {dt} {f.name}")
             except OSError:
                 pass
@@ -1685,7 +2050,8 @@ class App:
         self.cursor_pos = (y, x + pw + self.cmd_cursor - view_offset)
 
     def draw_err_line(self, x: int, y: int, w: int) -> None:
-        self.draw_string(x, y, self.err_msg, w, curses.color_pair(CP_ERR))
+        attr = curses.color_pair(CP_ERR) | curses.A_BOLD
+        self.draw_string(x, y, self.err_msg, w, attr)
 
     def draw_menu(self) -> None:
         menu = self.menus.get(self.menu_active)
@@ -1738,9 +2104,7 @@ class App:
     def cmd_insert_string(self, s: str) -> None:
         chars = list(s)
         self.cmd_line = (
-            self.cmd_line[: self.cmd_cursor]
-            + chars
-            + self.cmd_line[self.cmd_cursor :]
+            self.cmd_line[: self.cmd_cursor] + chars + self.cmd_line[self.cmd_cursor :]
         )
         self.cmd_cursor += len(chars)
 
@@ -1940,9 +2304,7 @@ class App:
             if key in (curses.KEY_ENTER, 10, 13):
                 if p.tagged:
                     names = [
-                        quote_if_needed(f.name)
-                        for f in p.files
-                        if p.tagged.get(f.name)
+                        quote_if_needed(f.name) for f in p.files if p.tagged.get(f.name)
                     ]
                     self.cmd_insert_string(" ".join(names))
                 else:
@@ -2140,82 +2502,77 @@ def main(stdscr: curses.window) -> None:
     cwd = os.getcwd() or home
 
     saved = load_state()
-    left_dir = cwd
-    right_dir = home
-    if saved:
-        if saved.panels[0]:
-            left_dir = saved.panels[0]
-        if saved.panels[1]:
-            right_dir = saved.panels[1]
+    if saved and saved.active in (0, 1):
+        inactive = 1 - saved.active
+        inactive_dir = saved.panels[inactive] or home
+        if saved.active == 0:
+            left_dir, right_dir = cwd, inactive_dir
+        else:
+            left_dir, right_dir = inactive_dir, cwd
+    else:
+        left_dir, right_dir = cwd, home
 
     app = App(stdscr, left_dir, right_dir, saved)
 
     # Register menus
     app.add_menu(
         "command",
-        "c",
-        "copy",
-        lambda: app.action_copy(),
-        "m",
-        "move",
-        lambda: app.action_move(),
-        "d",
-        "delete",
-        lambda: app.action_remove(),
-        "k",
-        "mkdir",
-        lambda: app.action_mkdir(),
-        "t",
-        "touch",
-        lambda: app.action_touch(),
-        "p",
-        "chmod",
-        lambda: app.action_chmod(),
-        "r",
-        "rename",
-        lambda: app.action_rename(),
-        "g",
-        "chdir",
-        lambda: app.action_chdir(),
+        [
+            MenuItem("c", "copy", lambda: app.action_copy()),
+            MenuItem("m", "move", lambda: app.action_move()),
+            MenuItem("d", "delete", lambda: app.action_remove()),
+            MenuItem("k", "mkdir", lambda: app.action_mkdir()),
+            MenuItem("t", "touch", lambda: app.action_touch()),
+            MenuItem("p", "chmod", lambda: app.action_chmod()),
+            MenuItem("r", "rename", lambda: app.action_rename()),
+            MenuItem("g", "chdir", lambda: app.action_chdir()),
+        ],
     )
 
     app.add_menu(
         "bookmark",
-        "h",
-        "home",
-        lambda: app.action_chdir(home),
-        "d",
-        "desktop",
-        lambda: app.action_chdir(os.path.join(home, "Desktop")),
-        "w",
-        "downloads",
-        lambda: app.action_chdir(os.path.join(home, "Downloads")),
-        "o",
-        "documents",
-        lambda: app.action_chdir(os.path.join(home, "Documents")),
+        [
+            MenuItem("h", "home", lambda: app.action_chdir(home)),
+            MenuItem(
+                "d",
+                "desktop",
+                lambda: app.action_chdir(os.path.join(home, "Desktop")),
+            ),
+            MenuItem(
+                "w",
+                "downloads",
+                lambda: app.action_chdir(os.path.join(home, "Downloads")),
+            ),
+            MenuItem(
+                "g",
+                "github",
+                lambda: app.action_chdir(os.path.join(home, "github")),
+            ),
+            MenuItem(
+                "i",
+                "iproov",
+                lambda: app.action_chdir(os.path.join(home, "iproov")),
+            ),
+        ],
     )
 
     app.add_menu(
         "editor",
-        "v",
-        "vi %F",
-        lambda: app.action_run("vi %F"),
-        "c",
-        "cot %F",
-        lambda: app.action_run("cot %F"),
-        "x",
-        "view",
-        lambda: app.menu("view"),
+        [
+            MenuItem("v", "vi", lambda: app.action_run("vi %F")),
+            MenuItem("c", "cot", lambda: app.action_run("cot %F")),
+            MenuItem("m", "mcedit", lambda: app.action_run("mcedit %F")),
+            MenuItem("x", "view...", lambda: app.menu("view")),
+        ],
     )
 
     app.add_menu(
         "view",
-        "v",
-        "xxd",
-        lambda: app.action_run("xxd -g 1 %F"),
-        "l",
-        "less",
-        lambda: app.action_run("less %F"),
+        [
+            MenuItem("l", "less", lambda: app.action_run("less %F")),
+            MenuItem("j", "jq", lambda: app.action_run("cat %F | jq .")),
+            MenuItem("v", "xxd", lambda: app.action_run("xxd -g 1 %F")),
+        ],
     )
 
     # Register keymaps
