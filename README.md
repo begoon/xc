@@ -1,6 +1,42 @@
 # xc
 
-A two-panel console file manager inspired by Midnight Commander, written in Go.
+A two-panel console file manager inspired by Midnight Commander, written in Python.
+
+## Intro
+
+The Python version of xc is a single self-contained script (`xc.py`) that runs via [uv](https://docs.astral.sh/uv/). This means:
+
+- **Zero setup** -- no virtualenv, no `pip install`, no `requirements.txt`. Just run `uv run xc.py`.
+- **Inline dependencies** -- the script header declares its own dependencies (`boto3`, `google-cloud-storage`), and uv resolves and caches them automatically on the first run.
+- **Reproducible** -- uv pins the Python version (`>=3.11`) and handles isolation, so the script works the same way on any machine.
+- **Single file to deploy** -- copy `xc.py` to a server, a dotfiles repo, or a USB stick. There is nothing else to carry.
+
+### Installing uv
+
+```sh
+# macOS / Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Homebrew
+brew install uv
+
+# Windows
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+After installing, run the file manager with:
+
+```sh
+uv run xc.py
+```
+
+The script has a shebang line, so you can rename it, make it executable, and put it on your PATH:
+
+```sh
+cp xc.py ~/.local/bin/xc
+chmod +x ~/.local/bin/xc
+xc
+```
 
 ## Macros
 

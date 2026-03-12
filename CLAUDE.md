@@ -2,17 +2,11 @@
 
 ## Project overview
 
-Dual-language (Go + Python) two-panel file manager with virtual filesystem support.
+Single-file Python two-panel file manager with virtual filesystem support.
 
-- `main.go` - Go implementation
-- `xc.py` - Python implementation (standalone uv script)
-- `vfs/` - Go VFS implementations
+- `xc.py` - standalone uv script, all code in one file
 
-## Python implementation (`xc.py`)
-
-Single-file curses application. All code lives in `xc.py`.
-
-### Architecture
+## Architecture
 
 - **VFS layer**: Abstract `VFS` base class with implementations: `LocalFS`, `TarFS`, `S3FS`, `GCSFS`, `SSHFS`
 - **Panel**: File list panel with VFS stack for nested navigation
@@ -33,14 +27,10 @@ Detection is probe-based: iterate `probes` list, first match wins. Add new VFS t
 
 Run `black xc.py` after edits.
 
-## Building / running
+## Running
 
-```
-# Python
+```sh
 uv run xc.py
-
-# Go
-go build -o xc .
 ```
 
 ## State

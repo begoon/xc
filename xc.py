@@ -25,6 +25,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
+VERSION = "0.1.0"
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -1849,6 +1851,14 @@ class App:
             self.panels[1],
             self.active == 1,
         )
+        # Version in top-right corner (keep corner char + char before it)
+        ver = " " + VERSION + " "
+        vx = w - 2 - len(ver)
+        if vx > panel_w + 1:
+            attr_border = curses.color_pair(CP_BORDER)
+            for i, ch in enumerate(ver):
+                self.set_cell(vx + i, 0, ch, attr_border)
+
         self.draw_status_line(0, h - 3, w)
         self.draw_cmd_line(0, h - 2, w)
         self.draw_err_line(0, h - 1, w)
@@ -2518,14 +2528,14 @@ def main(stdscr: curses.window) -> None:
     app.add_menu(
         "command",
         [
-            MenuItem("c", "copy", lambda: app.action_copy()),
-            MenuItem("m", "move", lambda: app.action_move()),
-            MenuItem("d", "delete", lambda: app.action_remove()),
-            MenuItem("k", "mkdir", lambda: app.action_mkdir()),
-            MenuItem("t", "touch", lambda: app.action_touch()),
-            MenuItem("p", "chmod", lambda: app.action_chmod()),
-            MenuItem("r", "rename", lambda: app.action_rename()),
-            MenuItem("g", "chdir", lambda: app.action_chdir()),
+            MenuItem("c", "copy", app.action_copy),
+            MenuItem("m", "move", app.action_move),
+            MenuItem("d", "delete", app.action_remove),
+            MenuItem("k", "mkdir", app.action_mkdir),
+            MenuItem("t", "touch", app.action_touch),
+            MenuItem("p", "chmod", app.action_chmod),
+            MenuItem("r", "rename", app.action_rename),
+            MenuItem("g", "chdir", app.action_chdir),
         ],
     )
 
