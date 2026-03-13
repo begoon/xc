@@ -58,7 +58,9 @@ def truncate_log(path: Path) -> None:
 
 class LogFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
-        ts = datetime.fromtimestamp(record.created).strftime("%Y-%m-%dT%H:%M:%S")
+        ts = datetime.fromtimestamp(record.created).strftime(
+            "%Y-%m-%dT%H:%M:%S"
+        )
         msg = record.getMessage()
         return f"{ts} {record.levelname} {msg}"
 
@@ -255,8 +257,8 @@ class LocalFS(VFS):
             except OSError:
                 continue
             ft = FILE_TYPE_FILE
-            is_sym = entry.is_symlink()
-            if is_sym:
+            is_symlink = entry.is_symlink()
+            if is_symlink:
                 ft = FILE_TYPE_SYMLINK
             elif entry.is_dir(follow_symlinks=False):
                 ft = FILE_TYPE_DIR
@@ -268,7 +270,7 @@ class LocalFS(VFS):
                 mod_time=info.st_mtime,
                 executable=executable,
             )
-            if is_sym:
+            if is_symlink:
                 try:
                     vf.link_target = os.readlink(os.path.join(path, entry.name))
                 except OSError:
@@ -453,7 +455,9 @@ class S3FS(VFS):
                     continue
                 mt = obj.get("LastModified")
                 ts = mt.timestamp() if mt else 0.0
-                files.append(VFile(name=name, size=obj.get("Size", 0), mod_time=ts))
+                files.append(
+                    VFile(name=name, size=obj.get("Size", 0), mod_time=ts)
+                )
         return sort_files(files)
 
     def read_file(self, path: str) -> io.IOBase:
@@ -668,7 +672,9 @@ class SSHFS(VFS):
 
     def _run(self, cmd: str, *, timeout: int = 30) -> str:
         args = self._ssh_args() + [cmd]
-        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(
+            args, capture_output=True, text=True, timeout=timeout
+        )
         if r.returncode != 0:
             raise OSError(r.stderr.strip() or f"ssh command failed: {cmd}")
         return r.stdout
@@ -1806,7 +1812,9 @@ class App:
         except curses.error:
             pass
 
-    def draw_string(self, x: int, y: int, s: str, max_w: int, attr: int) -> None:
+    def draw_string(
+        self, x: int, y: int, s: str, max_w: int, attr: int
+    ) -> None:
         runes = list(s)
         out = []
         for i in range(max_w):
@@ -1964,7 +1972,12 @@ class App:
             if i < len(counter):
                 self.set_cell(x + i, bottom_y, counter[i], attr_border)
             elif suffix and suffix_start <= i < suffix_start + len(suffix):
-                self.set_cell(x + i, bottom_y, suffix[i - suffix_start], attr_border)
+                self.set_cell(
+                    x + i,
+                    bottom_y,
+                    suffix[i - suffix_start],
+                    attr_border,
+                )
             elif i == w - 1:
                 self.set_cell(x + i, bottom_y, curses.ACS_LRCORNER, attr_border)
             else:
@@ -1992,7 +2005,9 @@ class App:
                 info = os.lstat(dp)
                 mode = stat.filemode(info.st_mode)
                 nlinks = info.st_nlink
-                dt = datetime.fromtimestamp(info.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+                dt = datetime.fromtimestamp(info.st_mtime).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
                 parts.append(f"{mode} {nlinks} {info.st_size} {dt} {f.name}")
             except OSError:
                 pass
@@ -2114,7 +2129,9 @@ class App:
     def cmd_insert_string(self, s: str) -> None:
         chars = list(s)
         self.cmd_line = (
-            self.cmd_line[: self.cmd_cursor] + chars + self.cmd_line[self.cmd_cursor :]
+            self.cmd_line[: self.cmd_cursor]
+            + chars
+            + self.cmd_line[self.cmd_cursor :]
         )
         self.cmd_cursor += len(chars)
 
@@ -2314,7 +2331,9 @@ class App:
             if key in (curses.KEY_ENTER, 10, 13):
                 if p.tagged:
                     names = [
-                        quote_if_needed(f.name) for f in p.files if p.tagged.get(f.name)
+                        quote_if_needed(f.name)
+                        for f in p.files
+                        if p.tagged.get(f.name)
                     ]
                     self.cmd_insert_string(" ".join(names))
                 else:
