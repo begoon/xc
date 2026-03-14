@@ -17,15 +17,17 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
+import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -2615,7 +2617,27 @@ def main(stdscr: curses.window) -> None:
     app.run()
 
 
+def self_update() -> None:
+    url = "https://raw.githubusercontent.com/begoon/xc/main/xc.py"
+    exe = Path(sys.argv[0]).resolve()
+    prev = exe.with_name("xc.prev")
+    print(f"updating {exe} ...")
+    try:
+        with urllib.request.urlopen(url) as resp:
+            data = resp.read()
+    except Exception as e:
+        print(f"download failed: {e}")
+        sys.exit(1)
+    shutil.copy2(exe, prev)
+    exe.write_bytes(data)
+    os.chmod(exe, os.stat(exe).st_mode | stat.S_IXUSR | stat.S_IXGRP)
+    print(f"updated ({len(data)} bytes), previous version saved to {prev}")
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "-u":
+        self_update()
+        sys.exit(0)
     init_logging()
     log.info("starting xc.py")
     try:
