@@ -27,7 +27,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -2617,21 +2617,40 @@ def main(stdscr: curses.window) -> None:
     app.run()
 
 
+def _parse_version(text: str) -> tuple[int, ...]:
+    import re
+
+    m = re.search(r'^VERSION\s*=\s*["\']([^"\']+)["\']', text, re.MULTILINE)
+    if not m:
+        return (0,)
+    return tuple(int(x) for x in m.group(1).split("."))
+
+
 def self_update() -> None:
     url = "https://raw.githubusercontent.com/begoon/xc/main/xc.py"
     exe = Path(sys.argv[0]).resolve()
     prev = exe.with_name("xc.prev")
-    print(f"updating {exe} ...")
+    print(f"fetching {url} ...")
     try:
         with urllib.request.urlopen(url) as resp:
             data = resp.read()
     except Exception as e:
         print(f"download failed: {e}")
         sys.exit(1)
+    remote_text = data.decode("utf-8", errors="replace")
+    remote_ver = _parse_version(remote_text)
+    local_ver = _parse_version(
+        exe.read_text(encoding="utf-8", errors="replace")
+    )
+    rv = ".".join(str(x) for x in remote_ver)
+    lv = ".".join(str(x) for x in local_ver)
+    if remote_ver <= local_ver:
+        print(f"already up to date (local {lv}, remote {rv})")
+        return
     shutil.copy2(exe, prev)
     exe.write_bytes(data)
     os.chmod(exe, os.stat(exe).st_mode | stat.S_IXUSR | stat.S_IXGRP)
-    print(f"updated ({len(data)} bytes), previous version saved to {prev}")
+    print(f"updated {lv} -> {rv}, previous version saved to {prev}")
 
 
 if __name__ == "__main__":
