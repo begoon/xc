@@ -9,6 +9,33 @@ install:
 install-vmi:
     scp xc.py vmi:.local/bin/xc
 
+version new="":
+    #!/usr/bin/env python3
+    import sys, re; sys.path.insert(0, ".")
+    from xc import VERSION, _parse_version
+
+    new = "{{ new }}"
+    if not new:
+        print(VERSION)
+        sys.exit(0)
+
+    old_version = _parse_version(f'VERSION = "{VERSION}"')
+    new_version = _parse_version(f'VERSION = "{new}"')
+    if new_version <= old_version:
+        sys.exit(f"new version {new} must be higher than current {VERSION}")
+
+    path = "xc.py"
+    text = open(path).read()
+    text = re.sub(
+        r'^(VERSION\s*=\s*["\'])[^"\']+(["\'])',
+        rf'\g<1>{new}\2',
+        text,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    open(path, "w").write(text)
+    print(f"{VERSION} -> {new}")
+
 push:
     #!/usr/bin/env python3
     import sys
