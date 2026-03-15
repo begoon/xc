@@ -14,12 +14,15 @@ import io
 import json
 import logging
 import os
+import select
 import shutil
 import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
+import termios
+import tty
 import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -27,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-VERSION = "0.1.4"
+VERSION = "0.1.5"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -1140,7 +1143,7 @@ class App:
         self.scr = stdscr
         self.panels: list[Panel] = []
         self.active = 0
-        self.esc_mode = False
+        self.esc_mode = False  # used in cmd_mode for ESC+key combos
         self.cmd_mode = 0  # 0=off, 1=direct(;), 2=piped(:)
         self.cmd_line: list[str] = []
         self.cmd_cursor = 0
@@ -2379,6 +2382,38 @@ class App:
         elif 32 <= key <= 0x10FFFF:
             self.cmd_insert_string(chr(key))
 
+    def show_main_screen(self) -> None:
+        """Switch to main screen to see command output."""
+        curses.endwin()
+        sys.stdout.write("\n--- press ESC or Ctrl-O to return ---\n")
+        sys.stdout.flush()
+        fd = sys.stdin.fileno()
+        old_attr = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            while True:
+                ch = sys.stdin.read(1)
+                if not ch:
+                    break
+                c = ord(ch)
+                if c == 15:  # Ctrl-O
+                    break
+                if c == 27:  # ESC
+                    # Bare ESC vs escape sequence
+                    r, _, _ = select.select([fd], [], [], 0.05)
+                    if not r:
+                        break
+                    # Consume escape sequence
+                    while r:
+                        sys.stdin.read(1)
+                        r, _, _ = select.select([fd], [], [], 0.01)
+        except (EOFError, KeyboardInterrupt):
+            pass
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_attr)
+        self.scr.refresh()
+        curses.raw()
+
     def handle_meta(self, key: int) -> None:
         p = self.panels[self.active]
         h, _ = self.scr.getmaxyx()
@@ -2413,13 +2448,21 @@ class App:
             self.handle_cmd_key(key)
             return
 
-        # ESC handling
+        # ESC + key → meta combo, ESC ESC → main screen
         if key == 27:
-            self.esc_mode = True
-            return
-        if self.esc_mode:
-            self.esc_mode = False
-            self.handle_meta(key)
+            self.scr.timeout(500)
+            try:
+                next_key = self.scr.get_wch()
+            except curses.error:
+                next_key = None
+            self.scr.timeout(-1)
+            if next_key is not None:
+                if isinstance(next_key, str):
+                    next_key = ord(next_key)
+                if next_key == 27:
+                    self.show_main_screen()
+                else:
+                    self.handle_meta(next_key)
             return
 
         p = self.panels[self.active]
@@ -2465,6 +2508,8 @@ class App:
             p.move_to(p.cursor + page_size)
         elif key == 12:  # Ctrl-L
             p.reload()
+        elif key == 15:  # Ctrl-O - toggle main screen to see command output
+            self.show_main_screen()
         elif 32 <= key <= 0x10FFFF:
             ch = chr(key)
             # Check keymaps first
@@ -2507,6 +2552,7 @@ class App:
     def run(self) -> None:
         self.scr.keypad(True)
         self.scr.timeout(-1)
+        curses.set_escdelay(25)
         curses.raw()
         while True:
             self.draw()
