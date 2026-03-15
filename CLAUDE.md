@@ -23,9 +23,27 @@ Detection is probe-based: iterate `probes` list, first match wins. Add new VFS t
 - Macro expansion: `%f` (filename), `%F` (full path), `%x`/`%X` (without extension), `%m`/`%M` (tagged files), `%d`/`%D` (directory), `%&` (background)
 - `%F` on non-local VFS: downloads to temp, runs command, uploads back on success if file changed
 
-## Formatting
+### Screen switching
 
-Run `black xc.py` after edits.
+- App uses curses alternate screen; external commands run on the main screen so output stays in scroll buffer
+- ESC ESC in panel mode (or Ctrl-O) switches to main screen to review command output
+- ESC (or Ctrl-O) in main screen returns to panels
+- Bare ESC detection uses `select()` with 50ms timeout to distinguish from escape sequences
+
+### Dimmed files
+
+- `is_dimmed()` and `DIMMED_NAMES` set control which files appear dimmed (`A_DIM`)
+- Currently: dot files, `node_modules`, `__pycache__`
+
+### Color pairs
+
+- Color constants: `CP_DEF`, `CP_CURSOR`, `CP_TAGGED`, `CP_BORDER`, `CP_STATUS`, `CP_CMDLINE`, `CP_ERR`, `CP_MENU`, `CP_MENUSEL`, `CP_DIR`, `CP_DIM`
+- Initialized in `init_colors()`
+
+## Development
+
+- `pyproject.toml` is for local dev tooling only (black settings); `xc.py` is self-contained
+- Run `black xc.py` after edits
 
 ## Running
 

@@ -40,6 +40,10 @@ chmod +x ~/.local/bin/xc
 xc
 ```
 
+### Development
+
+The `pyproject.toml` in the repository is only used for local development tooling (e.g. `black` formatter settings). It is **not** needed to run xc -- `xc.py` is fully self-contained with its own inline dependency declarations.
+
 ### Self-update
 
 To update xc to the latest version from GitHub:
@@ -122,6 +126,20 @@ There are two command-line modes:
 | `:` | **Piped**  | Run a command; output is piped through `less`  |
 
 Both modes support macro expansion. The command runs in the active panel's current directory. If the command exits with a non-zero code, the error is shown in the bottom line.
+
+### Alternate screen and command output
+
+xc runs on the terminal's **alternate screen** -- the panels never mix with your shell's scroll buffer. When you run a shell command (`;` or `:`), xc temporarily switches back to the **main screen** so the command's output is preserved in the normal scroll buffer.
+
+To review previous command output without running anything:
+
+| Key              | Action                          |
+| ---------------- | ------------------------------- |
+| `Esc` `Esc`      | Switch to main screen           |
+| `Ctrl-O`         | Switch to main screen           |
+| `Esc` or `Ctrl-O` | Return to panels (main screen) |
+
+Once on the main screen you can scroll through your terminal's history as usual. Press `Esc` or `Ctrl-O` to return to the file panels.
 
 ### Search (`/`)
 

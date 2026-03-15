@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-VERSION = "0.1.5"
+VERSION = "0.1.6"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -1110,6 +1110,13 @@ CP_ERR = 7
 CP_MENU = 8
 CP_MENUSEL = 9
 CP_DIR = 10
+CP_DIM = 11
+
+DIMMED_NAMES = {"node_modules", "__pycache__"}
+
+
+def is_dimmed(name: str) -> bool:
+    return name.startswith(".") or name in DIMMED_NAMES
 
 
 def init_colors() -> None:
@@ -1125,6 +1132,7 @@ def init_colors() -> None:
     curses.init_pair(CP_MENU, curses.COLOR_WHITE, curses.COLOR_BLACK)
     curses.init_pair(CP_MENUSEL, curses.COLOR_BLACK, curses.COLOR_CYAN)
     curses.init_pair(CP_DIR, curses.COLOR_WHITE, curses.COLOR_BLACK)
+    curses.init_pair(CP_DIM, curses.COLOR_WHITE, curses.COLOR_BLACK)
 
 
 # ---------------------------------------------------------------------------
@@ -1910,6 +1918,7 @@ class App:
         attr_dir = curses.color_pair(CP_DIR) | curses.A_BOLD
         attr_cursor = curses.color_pair(CP_CURSOR)
         attr_tagged = curses.color_pair(CP_TAGGED)
+        attr_dim = curses.color_pair(CP_DIM) | curses.A_DIM
 
         # Top border with path
         self.set_cell(x, y, curses.ACS_ULCORNER, attr_border)
@@ -1941,12 +1950,15 @@ class App:
                         chars[0] = "+"
                         line = "".join(chars)
 
+                dimmed = is_dimmed(f.name)
                 if file_idx == p.cursor and active:
                     style = attr_cursor
                 elif tagged:
                     style = attr_tagged
                 elif file_idx == p.cursor:
                     style = attr_def
+                elif dimmed:
+                    style = attr_dim
                 elif f.is_dir():
                     style = attr_dir
                 else:
@@ -2630,7 +2642,18 @@ def main(stdscr: curses.window) -> None:
                 "iproov",
                 lambda: app.action_chdir(os.path.join(home, "iproov")),
             ),
-        ],
+        ]
+        + (
+            [
+                MenuItem(
+                    "f",
+                    "fork",
+                    lambda: app.action_run("fork"),
+                ),
+            ]
+            if sys.platform == "darwin"
+            else []
+        ),
     )
 
     app.add_menu(
