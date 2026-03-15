@@ -40,6 +40,16 @@ chmod +x ~/.local/bin/xc
 xc
 ```
 
+### Self-update
+
+To update xc to the latest version from GitHub:
+
+```sh
+xc -u
+```
+
+This fetches the latest `xc.py` from the repository, compares versions, and replaces the current binary if a newer version is available. The previous version is saved as `xc.prev` next to the executable.
+
 ## User manual
 
 ### Dual-panel concept

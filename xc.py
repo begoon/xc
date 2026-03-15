@@ -2626,29 +2626,31 @@ def _parse_version(text: str) -> tuple[int, ...]:
     return tuple(int(x) for x in m.group(1).split("."))
 
 
+REMOTE_URL = "https://raw.githubusercontent.com/begoon/xc/main/xc.py"
+
+
+def _fetch_remote() -> str:
+    print(f"fetching {REMOTE_URL} ...")
+    try:
+        with urllib.request.urlopen(REMOTE_URL) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        sys.exit(f"download failed: {e}")
+
+
 def self_update() -> None:
-    url = "https://raw.githubusercontent.com/begoon/xc/main/xc.py"
     exe = Path(sys.argv[0]).resolve()
     prev = exe.with_name("xc.prev")
-    print(f"fetching {url} ...")
-    try:
-        with urllib.request.urlopen(url) as resp:
-            data = resp.read()
-    except Exception as e:
-        print(f"download failed: {e}")
-        sys.exit(1)
-    remote_text = data.decode("utf-8", errors="replace")
-    remote_ver = _parse_version(remote_text)
-    local_ver = _parse_version(
-        exe.read_text(encoding="utf-8", errors="replace")
-    )
-    rv = ".".join(str(x) for x in remote_ver)
-    lv = ".".join(str(x) for x in local_ver)
-    if remote_ver <= local_ver:
+    remote_text = _fetch_remote()
+    remote_version = _parse_version(remote_text)
+    local_version = _parse_version(exe.read_text())
+    rv = ".".join(str(x) for x in remote_version)
+    lv = ".".join(str(x) for x in local_version)
+    if remote_version <= local_version:
         print(f"already up to date (local {lv}, remote {rv})")
         return
     shutil.copy2(exe, prev)
-    exe.write_bytes(data)
+    exe.write_text(remote_text, encoding="utf-8")
     os.chmod(exe, os.stat(exe).st_mode | stat.S_IXUSR | stat.S_IXGRP)
     print(f"updated {lv} -> {rv}, previous version saved to {prev}")
 
