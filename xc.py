@@ -228,6 +228,25 @@ def sort_files(files: list[VFile]) -> list[VFile]:
     return sorted(files, key=lambda f: (not f.is_dir(), f.name))
 
 
+# ---------------------------------------------------------------------------
+# File associations (platform-specific)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Assoc:
+    cmd: str
+    fire_and_forget: bool = False
+
+
+ASSOCIATIONS: dict[str, Assoc] = {}
+
+if sys.platform == "darwin":
+    for _ext in (".jpeg", ".jpg", ".png", ".mov", ".mp4", ".pdf"):
+        ASSOCIATIONS[_ext] = Assoc(cmd="open %f", fire_and_forget=True)
+    ASSOCIATIONS[".json"] = Assoc(cmd="cat %f | jq")
+
+
 class VFS(ABC):
     label: str = ""
 
@@ -306,6 +325,8 @@ class TarFS(VFS):
 
     def __init__(self) -> None:
         self.dirs: dict[str, list[VFile]] | None = None
+        self.archive_path: str = ""
+        self.tar_mode: str = "r:"
 
     def probe(self, header: bytes, filename: str) -> bool:
         lower = filename.lower()
@@ -375,6 +396,8 @@ class TarFS(VFS):
             dirs[d] = sort_files(dirs[d])
         new_fs = TarFS()
         new_fs.dirs = dirs
+        new_fs.archive_path = filename
+        new_fs.tar_mode = mode
         return new_fs
 
     def read_dir(self, path: str) -> list[VFile]:
@@ -385,7 +408,16 @@ class TarFS(VFS):
         return self.dirs[path]
 
     def read_file(self, path: str) -> io.IOBase:
-        raise OSError("reading files from tar archives not supported")
+        tf = tarfile.open(self.archive_path, self.tar_mode)
+        member = tf.getmember(path)
+        f = tf.extractfile(member)
+        if f is None:
+            tf.close()
+            raise OSError(f"cannot read {path} from tar archive")
+        data = f.read()
+        f.close()
+        tf.close()
+        return io.BytesIO(data)
 
     def write_file(self, path: str, data: io.IOBase) -> None:
         raise OSError("writing to tar archives not supported")
@@ -395,6 +427,7 @@ class TarFS(VFS):
 
     def leave(self) -> None:
         self.dirs = None
+        self.archive_path = ""
 
 
 class ZipFS(VFS):
@@ -402,6 +435,7 @@ class ZipFS(VFS):
 
     def __init__(self) -> None:
         self.dirs: dict[str, list[VFile]] | None = None
+        self.archive_path: str = ""
 
     def probe(self, header: bytes, filename: str) -> bool:
         return filename.lower().endswith(".zip")
@@ -469,6 +503,7 @@ class ZipFS(VFS):
             dirs[d] = sort_files(dirs[d])
         new_fs = ZipFS()
         new_fs.dirs = dirs
+        new_fs.archive_path = filename
         return new_fs
 
     def read_dir(self, path: str) -> list[VFile]:
@@ -479,7 +514,10 @@ class ZipFS(VFS):
         return self.dirs[path]
 
     def read_file(self, path: str) -> io.IOBase:
-        raise OSError("reading files from zip archives not supported")
+        zf = zipfile.ZipFile(self.archive_path, "r")
+        data = zf.read(path)
+        zf.close()
+        return io.BytesIO(data)
 
     def write_file(self, path: str, data: io.IOBase) -> None:
         raise OSError("writing to zip archives not supported")
@@ -489,6 +527,7 @@ class ZipFS(VFS):
 
     def leave(self) -> None:
         self.dirs = None
+        self.archive_path = ""
 
 
 class CompressedFS(VFS):
@@ -508,6 +547,8 @@ class CompressedFS(VFS):
         self.inner_name: str = ""
         self.inner_size: int = 0
         self.inner_mtime: float = 0.0
+        self.archive_path: str = ""
+        self.ext: str = ""
 
     def probe(self, header: bytes, filename: str) -> bool:
         lower = filename.lower()
@@ -544,6 +585,8 @@ class CompressedFS(VFS):
         new_fs.inner_name = inner_name
         new_fs.inner_size = len(data)
         new_fs.inner_mtime = file_mtime
+        new_fs.archive_path = filename
+        new_fs.ext = ext
         return new_fs
 
     def read_dir(self, path: str) -> list[VFile]:
@@ -559,7 +602,10 @@ class CompressedFS(VFS):
         ]
 
     def read_file(self, path: str) -> io.IOBase:
-        raise OSError("reading files from compressed archives not supported")
+        _, opener = self.EXTS[self.ext]
+        with opener(self.archive_path, "rb") as f:
+            data = f.read()
+        return io.BytesIO(data)
 
     def write_file(self, path: str, data: io.IOBase) -> None:
         raise OSError("writing to compressed archives not supported")
@@ -1002,12 +1048,14 @@ class Panel:
         probes: list[VFS],
         on_error: Callable[[str], None],
         on_exec: Callable[[str], None],
+        on_run: Callable[[str, bool], None] | None = None,
     ):
         self.path = path
         self.fs = fs
         self.probes = probes
         self.on_error = on_error
         self.on_exec = on_exec
+        self.on_run = on_run
         self.files: list[VFile] = []
         self.cursor = 0
         self.offset = 0
@@ -1098,6 +1146,10 @@ class Panel:
             self.offset = 0
             self.load_dir()
             return
+        ext = f.ext().lower()
+        if ext and ext in ASSOCIATIONS and self.on_run:
+            assoc = ASSOCIATIONS[ext]
+            self.on_run(assoc.cmd, assoc.fire_and_forget)
 
     def go_up(self) -> None:
         at_root = not self.path or os.path.dirname(self.path) == self.path
@@ -1376,6 +1428,7 @@ class App:
                 probes,
                 self.set_error,
                 lambda cmd: self.run_shell_cmd(cmd, False),
+                self.run_assoc,
             ),
             Panel(
                 right_dir,
@@ -1383,6 +1436,7 @@ class App:
                 probes,
                 self.set_error,
                 lambda cmd: self.run_shell_cmd(cmd, False),
+                self.run_assoc,
             ),
         ]
 
@@ -1935,6 +1989,12 @@ class App:
         self.scr.refresh()
         curses.raw()
         p.reload()
+
+    def run_assoc(self, cmd: str, fire_and_forget: bool) -> None:
+        expanded, bg = self.expand_macro(cmd)
+        if bg:
+            fire_and_forget = True
+        self.run_shell_cmd(expanded, fire_and_forget)
 
     def exec_command(self) -> None:
         cmd = "".join(self.cmd_line).strip()
