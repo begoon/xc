@@ -9,32 +9,32 @@
 """xc - two-panel console file manager."""
 from __future__ import annotations
 
+import bz2
 import curses
+import gzip
 import io
 import json
 import logging
+import lzma
 import os
 import select
 import shutil
 import stat
 import subprocess
 import sys
-import bz2
-import gzip
-import lzma
 import tarfile
-import zipfile
 import tempfile
 import termios
 import tty
 import urllib.request
+import zipfile
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -244,6 +244,8 @@ ASSOCIATIONS: dict[str, Assoc] = {}
 if sys.platform == "darwin":
     for _ext in (".jpeg", ".jpg", ".png", ".mov", ".mp4", ".pdf"):
         ASSOCIATIONS[_ext] = Assoc(cmd="open %f", fire_and_forget=True)
+
+if sys.platform == "darwin" or sys.platform.startswith("linux"):
     ASSOCIATIONS[".json"] = Assoc(cmd="cat %f | jq")
 
 
