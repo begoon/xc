@@ -34,7 +34,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -96,6 +96,7 @@ class AppState:
     panels: list[str] = field(default_factory=lambda: ["", ""])
     active: int = 0
     copy_history: list[list[str]] = field(default_factory=lambda: [[], []])
+    cmd_history: list[str] = field(default_factory=list)
 
 
 def load_state() -> AppState | None:
@@ -106,6 +107,7 @@ def load_state() -> AppState | None:
         st.panels = data.get("panels", ["", ""])
         st.active = data.get("active", 0)
         st.copy_history = data.get("copy_history", [[], []])
+        st.cmd_history = data.get("cmd_history", [])
         return st
     except Exception:
         return None
@@ -120,6 +122,7 @@ def save_state(st: AppState) -> None:
                     "panels": st.panels,
                     "active": st.active,
                     "copy_history": st.copy_history,
+                    "cmd_history": st.cmd_history,
                 },
                 indent=2,
             )
@@ -1385,10 +1388,14 @@ class App:
         self.scr = stdscr
         self.panels: list[Panel] = []
         self.active = 0
-        self.esc_mode = False  # used in cmd_mode for ESC+key combos
         self.cmd_mode = 0  # 0=off, 1=direct(;), 2=piped(:)
         self.cmd_line: list[str] = []
         self.cmd_cursor = 0
+        self.cmd_history: list[str] = []
+        self.cmd_hist_mode = False
+        self.cmd_hist_idx = -1
+        self.cmd_hist_offset = 0
+        self.cmd_line_saved: list[str] = []
         self.search_mode = False
         self.search_query: list[str] = []
         self.copy_mode = 0  # 0=off, 1=src, 2=dst
@@ -1444,6 +1451,7 @@ class App:
 
         if saved:
             self.copy_history = saved.copy_history
+            self.cmd_history = saved.cmd_history
             if saved.active in (0, 1):
                 self.active = saved.active
 
@@ -1508,6 +1516,7 @@ class App:
             panels=[self.panels[0].path, self.panels[1].path],
             active=self.active,
             copy_history=self.copy_history,
+            cmd_history=self.cmd_history,
         )
         save_state(st)
 
@@ -2002,6 +2011,9 @@ class App:
         cmd = "".join(self.cmd_line).strip()
         if not cmd:
             return
+        self.add_cmd_history(cmd)
+        self.cmd_hist_mode = False
+        self.cmd_hist_idx = -1
         mode = self.cmd_mode
         self.cmd_mode = 0
         self.cmd_line = []
@@ -2057,6 +2069,12 @@ class App:
         self.copy_history[idx] = [val] + hist
         if len(self.copy_history[idx]) > 20:
             self.copy_history[idx] = self.copy_history[idx][:20]
+
+    def add_cmd_history(self, val: str) -> None:
+        hist = [h for h in self.cmd_history if h != val]
+        self.cmd_history = [val] + hist
+        if len(self.cmd_history) > 100:
+            self.cmd_history = self.cmd_history[:100]
 
     # -- Drawing --
 
@@ -2137,6 +2155,8 @@ class App:
             self.draw_menu()
         if self.copy_mode > 0:
             self.draw_copy_history(w, h)
+        if self.cmd_hist_mode:
+            self.draw_cmd_history(w, h)
 
         if self.cursor_pos:
             curses.curs_set(1)
@@ -2390,6 +2410,30 @@ class App:
             style = attr_sel if i == self.copy_hist_idx else attr
             self.draw_string(0, row_y, " " + item, screen_w, style)
 
+    def draw_cmd_history(self, screen_w: int, screen_h: int) -> None:
+        if not self.cmd_history:
+            return
+        total = len(self.cmd_history)
+        visible_h = min(5, total)
+        cmd_y = screen_h - 2
+        if self.cmd_hist_idx < self.cmd_hist_offset:
+            self.cmd_hist_offset = self.cmd_hist_idx
+        if self.cmd_hist_idx >= self.cmd_hist_offset + visible_h:
+            self.cmd_hist_offset = self.cmd_hist_idx - visible_h + 1
+        attr = curses.color_pair(CP_CMDLINE)
+        attr_sel = curses.color_pair(CP_CURSOR)
+        for i in range(visible_h):
+            idx = self.cmd_hist_offset + i
+            if idx >= total:
+                break
+            row_y = cmd_y - visible_h + i
+            if row_y < 0:
+                continue
+            style = attr_sel if idx == self.cmd_hist_idx else attr
+            self.draw_string(
+                0, row_y, " " + self.cmd_history[idx], screen_w, style
+            )
+
     # -- Key handling --
 
     def cmd_insert_string(self, s: str) -> None:
@@ -2586,15 +2630,27 @@ class App:
     def handle_cmd_key(self, key: int) -> None:
         p = self.panels[self.active]
         if key == 27:
-            if not self.cmd_line:
-                self.cmd_mode = 0
+            if self.cmd_hist_mode:
+                self.cmd_hist_mode = False
+                self.cmd_line = list(self.cmd_line_saved)
+                self.cmd_cursor = len(self.cmd_line)
+                self.cmd_hist_idx = -1
                 return
-            self.esc_mode = True
-            return
-
-        if self.esc_mode:
-            self.esc_mode = False
-            if key in (curses.KEY_ENTER, 10, 13):
+            # Read next key with timeout to detect ESC+key vs bare ESC
+            self.scr.timeout(500)
+            try:
+                next_key = self.scr.get_wch()
+            except curses.error:
+                next_key = None
+            self.scr.timeout(-1)
+            if next_key is None:
+                # Bare ESC → exit cmd mode
+                self.cmd_mode = 0
+                self.cmd_hist_mode = False
+                return
+            if isinstance(next_key, str):
+                next_key = ord(next_key)
+            if next_key in (curses.KEY_ENTER, 10, 13):
                 if p.tagged:
                     names = [
                         quote_if_needed(f.name)
@@ -2606,6 +2662,34 @@ class App:
                     f = p.selected_file()
                     if f and f.name != "..":
                         self.cmd_insert_string(quote_if_needed(f.name))
+            elif next_key == ord("h"):
+                if self.cmd_history:
+                    self.cmd_hist_mode = True
+                    self.cmd_hist_idx = 0
+                    self.cmd_hist_offset = 0
+                    self.cmd_line_saved = list(self.cmd_line)
+                    self.cmd_line = list(self.cmd_history[0])
+                    self.cmd_cursor = len(self.cmd_line)
+            return
+
+        if self.cmd_hist_mode:
+            if key == curses.KEY_UP:
+                if self.cmd_hist_idx > 0:
+                    self.cmd_hist_idx -= 1
+                    self.cmd_line = list(self.cmd_history[self.cmd_hist_idx])
+                    self.cmd_cursor = len(self.cmd_line)
+            elif key == curses.KEY_DOWN:
+                if self.cmd_hist_idx < len(self.cmd_history) - 1:
+                    self.cmd_hist_idx += 1
+                    self.cmd_line = list(self.cmd_history[self.cmd_hist_idx])
+                    self.cmd_cursor = len(self.cmd_line)
+            elif key in (curses.KEY_ENTER, 10, 13):
+                self.cmd_hist_mode = False
+            else:
+                self.cmd_hist_mode = False
+                self.cmd_hist_idx = -1
+                if 32 <= key <= 0x10FFFF:
+                    self.cmd_insert_string(chr(key))
             return
 
         if key in (curses.KEY_ENTER, 10, 13):
