@@ -19,7 +19,11 @@ import shutil
 import stat
 import subprocess
 import sys
+import bz2
+import gzip
+import lzma
 import tarfile
+import zipfile
 import tempfile
 import termios
 import tty
@@ -30,7 +34,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-VERSION = "0.1.6"
+VERSION = "0.2.0"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -391,6 +395,182 @@ class TarFS(VFS):
 
     def leave(self) -> None:
         self.dirs = None
+
+
+class ZipFS(VFS):
+    label = "ZIP"
+
+    def __init__(self) -> None:
+        self.dirs: dict[str, list[VFile]] | None = None
+
+    def probe(self, header: bytes, filename: str) -> bool:
+        return filename.lower().endswith(".zip")
+
+    def enter(self, header: bytes, filename: str) -> VFS:
+        zf = zipfile.ZipFile(filename, "r")
+        dirs: dict[str, list[VFile]] = {}
+        seen: set[str] = set()
+
+        def ensure_dir_chain(dir_path: str) -> None:
+            if not dir_path:
+                return
+            parent = os.path.dirname(dir_path)
+            if parent == ".":
+                parent = ""
+            base = os.path.basename(dir_path)
+            key = parent + "\x00" + base
+            if key in seen:
+                return
+            seen.add(key)
+            ensure_dir_chain(parent)
+            dirs.setdefault(parent, []).append(
+                VFile(name=base, file_type=FILE_TYPE_DIR)
+            )
+
+        for info in zf.infolist():
+            name = os.path.normpath(info.filename)
+            if name in (".", ""):
+                continue
+            d = os.path.dirname(name)
+            if d == ".":
+                d = ""
+            base = os.path.basename(name)
+            if not base:
+                continue
+
+            is_dir = info.filename.endswith("/")
+            ft = FILE_TYPE_DIR if is_dir else FILE_TYPE_FILE
+
+            key = d + "\x00" + base
+            if key in seen:
+                continue
+            seen.add(key)
+            ensure_dir_chain(d)
+
+            mod_time = 0.0
+            try:
+                from datetime import datetime as _dt
+
+                mod_time = _dt(*info.date_time).timestamp()
+            except (ValueError, OSError):
+                pass
+
+            dirs.setdefault(d, []).append(
+                VFile(
+                    name=base,
+                    size=info.file_size,
+                    file_type=ft,
+                    mod_time=mod_time,
+                )
+            )
+
+        zf.close()
+        for d in dirs:
+            dirs[d] = sort_files(dirs[d])
+        new_fs = ZipFS()
+        new_fs.dirs = dirs
+        return new_fs
+
+    def read_dir(self, path: str) -> list[VFile]:
+        if self.dirs is None:
+            raise OSError("zip not opened")
+        if path not in self.dirs:
+            raise OSError(f"directory not found in archive: {path}")
+        return self.dirs[path]
+
+    def read_file(self, path: str) -> io.IOBase:
+        raise OSError("reading files from zip archives not supported")
+
+    def write_file(self, path: str, data: io.IOBase) -> None:
+        raise OSError("writing to zip archives not supported")
+
+    def mkdir_all(self, path: str) -> None:
+        raise OSError("creating directories in zip archives not supported")
+
+    def leave(self) -> None:
+        self.dirs = None
+
+
+class CompressedFS(VFS):
+    label = "GZ"
+
+    EXTS: dict[str, tuple[str, type]] = {
+        ".gz": ("GZ", gzip.GzipFile),
+        ".bz2": ("BZ2", bz2.BZ2File),
+        ".xz": ("XZ", lzma.LZMAFile),
+        ".lzma": ("LZMA", lzma.LZMAFile),
+    }
+
+    # Extensions that other VFS types handle (TarFS)
+    SKIP = (".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")
+
+    def __init__(self) -> None:
+        self.inner_name: str = ""
+        self.inner_size: int = 0
+        self.inner_mtime: float = 0.0
+
+    def probe(self, header: bytes, filename: str) -> bool:
+        lower = filename.lower()
+        if any(lower.endswith(s) for s in self.SKIP):
+            return False
+        return any(lower.endswith(ext) for ext in self.EXTS)
+
+    def _ext(self, filename: str) -> str:
+        lower = filename.lower()
+        for ext in self.EXTS:
+            if lower.endswith(ext):
+                return ext
+        return ""
+
+    def enter(self, header: bytes, filename: str) -> VFS:
+        ext = self._ext(filename)
+        label, opener = self.EXTS[ext]
+        base = os.path.basename(filename)
+        inner_name = base[: -len(ext)]
+        if not inner_name:
+            inner_name = base + ".out"
+
+        # Read to get the decompressed size and mtime
+        with opener(filename, "rb") as f:
+            data = f.read()
+
+        try:
+            file_mtime = os.path.getmtime(filename)
+        except OSError:
+            file_mtime = 0.0
+
+        new_fs = CompressedFS()
+        new_fs.label = label
+        new_fs.inner_name = inner_name
+        new_fs.inner_size = len(data)
+        new_fs.inner_mtime = file_mtime
+        return new_fs
+
+    def read_dir(self, path: str) -> list[VFile]:
+        if path != "":
+            raise OSError(f"directory not found: {path}")
+        return [
+            VFile(
+                name=self.inner_name,
+                size=self.inner_size,
+                file_type=FILE_TYPE_FILE,
+                mod_time=self.inner_mtime,
+            )
+        ]
+
+    def read_file(self, path: str) -> io.IOBase:
+        raise OSError("reading files from compressed archives not supported")
+
+    def write_file(self, path: str, data: io.IOBase) -> None:
+        raise OSError("writing to compressed archives not supported")
+
+    def mkdir_all(self, path: str) -> None:
+        raise OSError(
+            "creating directories in compressed archives not supported"
+        )
+
+    def leave(self) -> None:
+        pass
 
 
 class S3FS(VFS):
@@ -1180,7 +1360,14 @@ class App:
         self.cursor_pos: tuple[int, int] | None = None  # (y, x) for cursor
 
         local_fs = LocalFS()
-        probes: list[VFS] = [TarFS(), S3FS(), GCSFS(), SSHFS()]
+        probes: list[VFS] = [
+            TarFS(),
+            ZipFS(),
+            CompressedFS(),
+            S3FS(),
+            GCSFS(),
+            SSHFS(),
+        ]
 
         self.panels = [
             Panel(
