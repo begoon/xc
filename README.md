@@ -145,6 +145,34 @@ Once on the main screen you can scroll through your terminal's history as usual.
 
 Press `/` to start an incremental search. Type characters to filter -- the cursor jumps to the first matching file. Press `Enter` to accept or `Esc` to cancel.
 
+### Grep (`s` / `S`)
+
+Press `s` for case-sensitive search or `S` for case-insensitive search. This is a two-step prompt:
+
+1. **File pattern** -- `grep in ` (or `igrep in `) appears. Enter a glob pattern to filter by filename. Leave empty to search all files.
+2. **Search string** -- `grep in *.py for ` appears. Enter the text to find. Leave empty to list files matching the pattern only.
+
+The file pattern uses Unix shell-style wildcards (matched against the filename only, not the path):
+
+| Pattern   | Meaning                                          | Example              |
+| --------- | ------------------------------------------------ | -------------------- |
+| `*`       | Matches everything                               | `*.py` -- all Python |
+| `?`       | Matches any single character                     | `?.txt` -- `a.txt`   |
+| `[seq]`   | Matches any character in *seq*                   | `[abc].py`           |
+| `[!seq]`  | Matches any character **not** in *seq*            | `[!.]cfg`            |
+
+Patterns do **not** support `**` (recursive globs) or path separators -- they match the base filename only.
+
+Search is implemented in pure Python -- no external tools required. Binary files are automatically skipped. Hidden directories (starting with `.`) are excluded. A spinner shows progress during search; press `ESC` to cancel.
+
+Results are displayed as a virtual filesystem tree (GREP) on the current panel. Navigate the results normally -- directories expand, `..` exits back to the real filesystem.
+
+Grep works only on local filesystems.
+
+### Command history (`Esc` `h`)
+
+In command-line mode (`;` or `:`), press `Esc` then `h` to open a history selector showing previously executed commands. Use `Up` / `Down` to browse, `Enter` to accept, `Esc` to cancel. History is persisted across sessions (up to 100 entries).
+
 ### Customizing menus
 
 xc is a single Python script. Menus and keymaps are defined at the bottom of the file as plain data -- just edit them to add your own editors, bookmarks, or commands:
@@ -162,12 +190,14 @@ There is no config file on purpose. The script **is** the config.
 
 Entering certain files opens them as virtual directories:
 
-| Extension                              | VFS | Description                         |
-| -------------------------------------- | --- | ----------------------------------- |
-| `.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`  | TAR | Browse tar archives                 |
-| `.s3`                                  | S3  | Browse Amazon S3 buckets            |
-| `.gcs`                                 | GCS | Browse Google Cloud Storage buckets |
-| `.ssh`                                 | SSH | Browse remote servers over SSH      |
+| Extension                                    | VFS  | Description                         |
+| -------------------------------------------- | ---- | ----------------------------------- |
+| `.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`        | TAR  | Browse tar archives                 |
+| `.zip`                                       | ZIP  | Browse zip archives                 |
+| `.gz`, `.bz2`, `.xz`, `.lzma`               | -    | View compressed single files        |
+| `.s3`                                        | S3   | Browse Amazon S3 buckets            |
+| `.gcs`                                       | GCS  | Browse Google Cloud Storage buckets |
+| `.ssh`                                       | SSH  | Browse remote servers over SSH      |
 
 VFS config files (`.s3`, `.gcs`, `.ssh`) are simple `key=value` text files. The path header shows the VFS type, e.g. `~/servers/prod.ssh (SSH)`.
 

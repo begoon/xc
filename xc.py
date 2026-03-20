@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import bz2
 import curses
+import fnmatch
 import gzip
 import io
 import json
@@ -22,6 +23,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 import tarfile
 import tempfile
 import termios
@@ -34,7 +36,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-VERSION = "0.2.2"
+VERSION = "0.2.3"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -1031,6 +1033,95 @@ class SSHFS(VFS):
         self.host = ""
 
 
+class GrepFS(VFS):
+    label = "GREP"
+
+    def __init__(self) -> None:
+        self.dirs: dict[str, list[VFile]] | None = None
+        self.base_dir: str = ""
+
+    def probe(self, header: bytes, filename: str) -> bool:
+        return False
+
+    def enter(self, header: bytes, filename: str) -> VFS:
+        raise OSError("GrepFS cannot be entered via probe")
+
+    def build_from_paths(self, base_dir: str, paths: list[str]) -> None:
+        self.base_dir = base_dir
+        dirs: dict[str, list[VFile]] = {}
+        seen_dirs: set[str] = set()
+
+        def ensure_dir(dir_path: str) -> None:
+            if not dir_path or dir_path in seen_dirs:
+                return
+            seen_dirs.add(dir_path)
+            parent = os.path.dirname(dir_path)
+            if parent == dir_path:
+                return
+            name = os.path.basename(dir_path)
+            ensure_dir(parent)
+            pk = parent
+            if pk not in dirs:
+                dirs[pk] = []
+            if not any(f.name == name for f in dirs[pk]):
+                dirs[pk].append(VFile(name=name, file_type=FILE_TYPE_DIR))
+
+        for rel in paths:
+            rel = rel.lstrip("./")
+            if not rel:
+                continue
+            d = os.path.dirname(rel)
+            name = os.path.basename(rel)
+            ensure_dir(d)
+            dk = d
+            if dk not in dirs:
+                dirs[dk] = []
+            full = os.path.join(base_dir, rel)
+            try:
+                st = os.stat(full)
+                ft = (
+                    FILE_TYPE_DIR
+                    if stat.S_ISDIR(st.st_mode)
+                    else FILE_TYPE_FILE
+                )
+                vf = VFile(
+                    name=name,
+                    size=st.st_size,
+                    file_type=ft,
+                    mod_time=st.st_mtime,
+                    executable=ft == FILE_TYPE_FILE
+                    and bool(st.st_mode & 0o111),
+                )
+            except OSError:
+                vf = VFile(name=name)
+            dirs[dk].append(vf)
+
+        for d in dirs:
+            dirs[d] = sort_files(dirs[d])
+        self.dirs = dirs
+
+    def read_dir(self, path: str) -> list[VFile]:
+        if self.dirs is None:
+            raise OSError("grep results not loaded")
+        if path not in self.dirs:
+            raise OSError(f"directory not found: {path}")
+        return self.dirs[path]
+
+    def read_file(self, path: str) -> io.IOBase:
+        full = os.path.join(self.base_dir, path)
+        return open(full, "rb")
+
+    def write_file(self, path: str, data: io.IOBase) -> None:
+        raise OSError("GrepFS is read-only")
+
+    def mkdir_all(self, path: str) -> None:
+        raise OSError("GrepFS is read-only")
+
+    def leave(self) -> None:
+        self.dirs = None
+        self.base_dir = ""
+
+
 # ---------------------------------------------------------------------------
 # Panel
 # ---------------------------------------------------------------------------
@@ -1398,6 +1489,11 @@ class App:
         self.cmd_line_saved: list[str] = []
         self.search_mode = False
         self.search_query: list[str] = []
+        self.grep_mode = 0  # 0=off, 1=file pattern, 2=search string
+        self.grep_sensitive = True
+        self.grep_edit: list[str] = []
+        self.grep_cursor = 0
+        self.grep_file_pattern = ""
         self.copy_mode = 0  # 0=off, 1=src, 2=dst
         self.copy_is_move = False
         self.copy_from = ""
@@ -1590,6 +1686,119 @@ class App:
             else:
                 result.append(shell_quote(val))
         return "".join(result), background
+
+    # -- Grep --
+
+    def start_grep(self, sensitive: bool) -> None:
+        p = self.panels[self.active]
+        if not isinstance(p.fs, LocalFS):
+            self.set_error("grep works only on local filesystem")
+            return
+        self.grep_sensitive = sensitive
+        self.grep_mode = 1
+        self.grep_edit = []
+        self.grep_cursor = 0
+        self.grep_file_pattern = ""
+
+    def spinner_check_esc(self, frame: int) -> bool:
+        """Update spinner on cmd line row. Returns True if ESC pressed."""
+        spinner = r"|/-\\"
+        h, w = self.scr.getmaxyx()
+        y = h - 2
+        attr = curses.color_pair(CP_CMDLINE)
+        ch = spinner[frame % len(spinner)]
+        self.draw_string(0, y, f" searching {ch} (ESC to stop)", w, attr)
+        self.scr.refresh()
+        try:
+            key = self.scr.get_wch()
+            if isinstance(key, str):
+                key = ord(key)
+            if key == 27:
+                return True
+        except curses.error:
+            pass
+        return False
+
+    def exec_grep(self) -> None:
+        search_str = "".join(self.grep_edit).strip()
+        file_pat = self.grep_file_pattern
+        p = self.panels[self.active]
+        base_dir = p.path
+        self.grep_mode = 0
+
+        paths: list[str] = []
+        cancelled = False
+        frame = 0
+        last_spin = 0.0
+        self.scr.nodelay(True)
+        try:
+            for dirpath, dirnames, filenames in os.walk(base_dir):
+                # Skip hidden directories
+                dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+                now = time.monotonic()
+                if now - last_spin >= 0.1:
+                    if self.spinner_check_esc(frame):
+                        cancelled = True
+                        break
+                    frame += 1
+                    last_spin = now
+                for name in filenames:
+                    if file_pat and not fnmatch.fnmatch(name, file_pat):
+                        continue
+                    full = os.path.join(dirpath, name)
+                    rel = os.path.relpath(full, base_dir)
+                    if not search_str:
+                        paths.append(rel)
+                        continue
+                    try:
+                        with open(full, "rb") as f:
+                            chunk = f.read(8192)
+                            if b"\x00" in chunk:
+                                continue  # skip binary
+                            text = chunk
+                            rest = f.read()
+                            if rest:
+                                text += rest
+                        content = text.decode("utf-8", errors="ignore")
+                        if self.grep_sensitive:
+                            if search_str in content:
+                                paths.append(rel)
+                        else:
+                            if search_str.lower() in content.lower():
+                                paths.append(rel)
+                    except (OSError, PermissionError):
+                        continue
+        except Exception as e:
+            self.set_error(str(e))
+            return
+        finally:
+            self.scr.nodelay(False)
+
+        if cancelled:
+            self.set_error("search cancelled")
+            return
+
+        if not paths:
+            self.set_error("no matches found")
+            return
+
+        gfs = GrepFS()
+        gfs.build_from_paths(base_dir, paths)
+        p.stack.append(
+            VFSEntry(
+                fs=p.fs,
+                path=p.path,
+                cursor=p.cursor,
+                offset=p.offset,
+                entry_path=base_dir,
+            )
+        )
+        p.fs = gfs
+        p.path = ""
+        p.cursor = 0
+        p.offset = 0
+        p.tagged = {}
+        p.load_dir()
 
     # -- Actions --
 
@@ -2332,6 +2541,21 @@ class App:
             self.cursor_pos = (y, x + pw + self.copy_cursor)
             return
 
+        if self.grep_mode > 0:
+            verb = "igrep" if not self.grep_sensitive else "grep"
+            if self.grep_mode == 1:
+                prompt = f"{verb} in "
+            else:
+                pat = self.grep_file_pattern or "*"
+                prompt = f"{verb} in {pat} for "
+            pw = len(prompt)
+            self.draw_string(x, y, prompt, pw, attr)
+            edit_w = w - pw
+            text = "".join(self.grep_edit)
+            self.draw_string(x + pw, y, text, edit_w, attr)
+            self.cursor_pos = (y, x + pw + self.grep_cursor)
+            return
+
         if self.search_mode:
             prompt = "/ "
             pw = 2
@@ -2596,6 +2820,50 @@ class App:
             )
             self.copy_cursor += 1
 
+    def handle_grep_key(self, key: int) -> None:
+        if key == 27:
+            self.grep_mode = 0
+            return
+        if key in (curses.KEY_ENTER, 10, 13):
+            if self.grep_mode == 1:
+                self.grep_file_pattern = "".join(self.grep_edit).strip()
+                self.grep_edit = []
+                self.grep_cursor = 0
+                self.grep_mode = 2
+            else:
+                self.exec_grep()
+            return
+        if key in (curses.KEY_BACKSPACE, 127, 8):
+            if self.grep_cursor > 0:
+                self.grep_edit = (
+                    self.grep_edit[: self.grep_cursor - 1]
+                    + self.grep_edit[self.grep_cursor :]
+                )
+                self.grep_cursor -= 1
+        elif key == curses.KEY_LEFT:
+            if self.grep_cursor > 0:
+                self.grep_cursor -= 1
+        elif key == curses.KEY_RIGHT:
+            if self.grep_cursor < len(self.grep_edit):
+                self.grep_cursor += 1
+        elif key == 1:  # Ctrl-A
+            self.grep_cursor = 0
+        elif key == 5:  # Ctrl-E
+            self.grep_cursor = len(self.grep_edit)
+        elif key == 21:  # Ctrl-U
+            self.grep_edit = self.grep_edit[self.grep_cursor :]
+            self.grep_cursor = 0
+        elif key == 11:  # Ctrl-K
+            self.grep_edit = self.grep_edit[: self.grep_cursor]
+        elif 32 <= key <= 0x10FFFF:
+            ch = chr(key)
+            self.grep_edit = (
+                self.grep_edit[: self.grep_cursor]
+                + [ch]
+                + self.grep_edit[self.grep_cursor :]
+            )
+            self.grep_cursor += 1
+
     def handle_search_key(self, key: int) -> None:
         if key == 27:
             self.search_mode = False
@@ -2785,6 +3053,9 @@ class App:
             return
         if self.copy_mode > 0:
             self.handle_copy_key(key)
+            return
+        if self.grep_mode > 0:
+            self.handle_grep_key(key)
             return
         if self.search_mode:
             self.handle_search_key(key)
@@ -3015,6 +3286,8 @@ def main(stdscr: curses.window) -> None:
     app.add_keymap("v", lambda: app.menu_selector("view"))
     app.add_keymap(";", lambda: setattr(app, "cmd_mode", 1))
     app.add_keymap(":", lambda: setattr(app, "cmd_mode", 2))
+    app.add_keymap("s", lambda: app.start_grep(True))
+    app.add_keymap("S", lambda: app.start_grep(False))
 
     app.run()
 
