@@ -36,7 +36,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-VERSION = "0.2.3"
+VERSION = "0.2.4"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -2542,12 +2542,12 @@ class App:
             return
 
         if self.grep_mode > 0:
-            verb = "igrep" if not self.grep_sensitive else "grep"
+            verb = "grep" if self.grep_sensitive else "(i)grep"
             if self.grep_mode == 1:
-                prompt = f"{verb} in "
+                prompt = "find in "
             else:
                 pat = self.grep_file_pattern or "*"
-                prompt = f"{verb} in {pat} for "
+                prompt = f"find in {pat} {verb} for "
             pw = len(prompt)
             self.draw_string(x, y, prompt, pw, attr)
             edit_w = w - pw
