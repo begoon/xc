@@ -20,6 +20,21 @@ version new="":
         sys.exit(0)
 
     old_version = _parse_version(f'VERSION = "{VERSION}"')
+
+    if new in ("+1", "+2", "+3"):
+        parts = list(old_version)
+        level = int(new[1])
+        if level == 1:
+            parts[2] += 1
+        elif level == 2:
+            parts[1] += 1
+            parts[2] = 0
+        elif level == 3:
+            parts[0] += 1
+            parts[1] = 0
+            parts[2] = 0
+        new = ".".join(str(x) for x in parts)
+
     new_version = _parse_version(f'VERSION = "{new}"')
     if new_version <= old_version:
         sys.exit(f"new version {new} must be higher than current {VERSION}")

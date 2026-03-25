@@ -36,7 +36,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-VERSION = "0.2.6"
+VERSION = "0.2.7"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -3333,10 +3333,14 @@ def main(stdscr: curses.window) -> None:
         "editor",
         [
             MenuItem("v", "vi", lambda: app.action_run("vi %F")),
-            MenuItem("c", "cot", lambda: app.action_run("cot %F")),
             MenuItem("m", "mcedit", lambda: app.action_run("mcedit %F")),
             MenuItem("x", "view...", lambda: app.menu("view")),
-        ],
+        ]
+        + (
+            [MenuItem("c", "cot", lambda: app.action_run("cot %F"))]
+            if sys.platform == "darwin"
+            else []
+        ),
     )
 
     app.add_menu(
