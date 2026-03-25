@@ -112,6 +112,21 @@ Press `Space` on a file to **tag** it (marked with `+`). Tagged files are used a
 
 Press `b` to open the **bookmark** menu for quick jumps to common directories (home, desktop, downloads, etc.).
 
+### Remotes (`r`)
+
+Press `r` to open the **remote** menu. This scans `~/.xc/remotes/` for VFS config files (`.s3`, `.gcs`, `.ssh`) and presents them as a selector. Choosing a remote opens it on the active panel, just like pressing `Enter` on a VFS config file.
+
+This lets you keep all your remote connections in one place and access them from any directory without navigating to where the config files live.
+
+Example setup:
+
+```text
+~/.xc/remotes/
+  production.s3
+  analytics.gcs
+  webserver.ssh
+```
+
 ### Editor (`e`) and view (`v`)
 
 Press `e` to open a file in an editor, or `v` to view it. These menus launch external commands with the current file path substituted via macros (see below). On remote VFS (SSH, S3, GCS), the file is automatically downloaded to a temp location, opened locally, and uploaded back if modified.
@@ -221,7 +236,7 @@ bucket=my-analytics-bucket
 key=service-account.json
 ```
 
-The `key` path can be relative (resolved from the config file's directory) or absolute. If omitted, application default credentials are used.
+The `key` path can be relative (resolved from the active panel's current directory) or absolute. If omitted, application default credentials are used.
 
 **SSH example** (`prod.ssh`):
 

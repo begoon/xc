@@ -36,7 +36,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-VERSION = "0.2.4"
+VERSION = "0.2.5"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -260,7 +260,7 @@ class VFS(ABC):
     @abstractmethod
     def probe(self, header: bytes, filename: str) -> bool: ...
     @abstractmethod
-    def enter(self, header: bytes, filename: str) -> VFS: ...
+    def enter(self, header: bytes, filename: str, cwd: str = "") -> VFS: ...
     @abstractmethod
     def read_dir(self, path: str) -> list[VFile]: ...
     @abstractmethod
@@ -277,7 +277,7 @@ class LocalFS(VFS):
     def probe(self, header: bytes, filename: str) -> bool:
         return os.path.isdir(filename)
 
-    def enter(self, header: bytes, filename: str) -> VFS:
+    def enter(self, header: bytes, filename: str, cwd: str = "") -> VFS:
         return self
 
     def read_dir(self, path: str) -> list[VFile]:
@@ -342,7 +342,7 @@ class TarFS(VFS):
             for ext in (".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2")
         )
 
-    def enter(self, header: bytes, filename: str) -> VFS:
+    def enter(self, header: bytes, filename: str, cwd: str = "") -> VFS:
         lower = filename.lower()
         mode = "r:"
         if lower.endswith(".gz") or lower.endswith(".tgz"):
@@ -447,7 +447,7 @@ class ZipFS(VFS):
     def probe(self, header: bytes, filename: str) -> bool:
         return filename.lower().endswith(".zip")
 
-    def enter(self, header: bytes, filename: str) -> VFS:
+    def enter(self, header: bytes, filename: str, cwd: str = "") -> VFS:
         zf = zipfile.ZipFile(filename, "r")
         dirs: dict[str, list[VFile]] = {}
         seen: set[str] = set()
@@ -570,7 +570,7 @@ class CompressedFS(VFS):
                 return ext
         return ""
 
-    def enter(self, header: bytes, filename: str) -> VFS:
+    def enter(self, header: bytes, filename: str, cwd: str = "") -> VFS:
         ext = self._ext(filename)
         label, opener = self.EXTS[ext]
         base = os.path.basename(filename)
@@ -638,7 +638,7 @@ class S3FS(VFS):
             return False
         return header.startswith(b"type=s3")
 
-    def enter(self, header: bytes, filename: str) -> VFS:
+    def enter(self, header: bytes, filename: str, cwd: str = "") -> VFS:
         bucket = access_key = secret_key = region = ""
         with open(filename) as f:
             for line in f:
@@ -729,7 +729,7 @@ class GCSFS(VFS):
             return False
         return header.startswith(b"type=gcs")
 
-    def enter(self, header: bytes, filename: str) -> VFS:
+    def enter(self, header: bytes, filename: str, cwd: str = "") -> VFS:
         bucket_name = key = ""
         with open(filename) as f:
             for line in f:
@@ -743,7 +743,8 @@ class GCSFS(VFS):
         if not bucket_name:
             raise OSError(f"no bucket specified in {filename}")
         if key and not os.path.isabs(key):
-            key = os.path.join(os.path.dirname(filename), key)
+            base = cwd if cwd else os.path.dirname(filename)
+            key = os.path.join(base, key)
         from google.cloud import storage as gcs_storage
 
         kwargs: dict = {}
@@ -941,7 +942,7 @@ class SSHFS(VFS):
         text = header.decode(errors="ignore")
         return "kind=ssh" in text or "host=" in text
 
-    def enter(self, header: bytes, filename: str) -> VFS:
+    def enter(self, header: bytes, filename: str, cwd: str = "") -> VFS:
         host = user = port = identity = ""
         with open(filename) as f:
             for raw in f:
@@ -1043,7 +1044,7 @@ class GrepFS(VFS):
     def probe(self, header: bytes, filename: str) -> bool:
         return False
 
-    def enter(self, header: bytes, filename: str) -> VFS:
+    def enter(self, header: bytes, filename: str, cwd: str = "") -> VFS:
         raise OSError("GrepFS cannot be entered via probe")
 
     def build_from_paths(self, base_dir: str, paths: list[str]) -> None:
@@ -1223,7 +1224,7 @@ class Panel:
             if not probe.probe(header, f.name):
                 continue
             try:
-                new_fs = probe.enter(header, full_path)
+                new_fs = probe.enter(header, full_path, cwd=self.path)
             except Exception as e:
                 self.report_error(e)
                 return
@@ -1246,6 +1247,32 @@ class Panel:
         if ext and ext in ASSOCIATIONS and self.on_run:
             assoc = ASSOCIATIONS[ext]
             self.on_run(assoc.cmd, assoc.fire_and_forget)
+
+    def enter_remote(self, path: str) -> None:
+        header = read_header(path, 32)
+        for probe in self.probes:
+            if not probe.probe(header, os.path.basename(path)):
+                continue
+            try:
+                new_fs = probe.enter(header, path, cwd=self.path)
+            except Exception as e:
+                self.report_error(e)
+                return
+            self.stack.append(
+                VFSEntry(
+                    fs=self.fs,
+                    path=self.path,
+                    cursor=self.cursor,
+                    offset=self.offset,
+                    entry_path=path,
+                )
+            )
+            self.fs = new_fs
+            self.path = ""
+            self.cursor = 0
+            self.offset = 0
+            self.load_dir()
+            return
 
     def go_up(self) -> None:
         at_root = not self.path or os.path.dirname(self.path) == self.path
@@ -2043,6 +2070,35 @@ class App:
                 p.load_dir()
 
             self.show_prompt("chdir: ", self.panels[self.active].path, do_it)
+
+    def action_remotes(self) -> None:
+        remotes_dir = os.path.join(os.path.expanduser("~"), ".xc", "remotes")
+        if not os.path.isdir(remotes_dir):
+            self.set_error("no remotes directory")
+            return
+        files = sorted(
+            f
+            for f in os.listdir(remotes_dir)
+            if os.path.isfile(os.path.join(remotes_dir, f))
+            and f.rsplit(".", 1)[-1] in ("s3", "gcs", "ssh")
+        )
+        if not files:
+            self.set_error("no remotes found")
+            return
+        keys = "abcdefghijklmnopqrstuvwxyz"
+        items: list[MenuItem] = []
+        for i, name in enumerate(files):
+            key = keys[i] if i < len(keys) else str(i)
+            path = os.path.join(remotes_dir, name)
+            items.append(
+                MenuItem(
+                    key,
+                    name,
+                    lambda p=path: self.panels[self.active].enter_remote(p),
+                )
+            )
+        self.add_menu("remote", items)
+        self.menu_selector("remote")
 
     def action_run(self, cmd: str) -> None:
         p = self.panels[self.active]
@@ -3286,6 +3342,7 @@ def main(stdscr: curses.window) -> None:
     app.add_keymap("v", lambda: app.menu_selector("view"))
     app.add_keymap(";", lambda: setattr(app, "cmd_mode", 1))
     app.add_keymap(":", lambda: setattr(app, "cmd_mode", 2))
+    app.add_keymap("r", lambda: app.action_remotes())
     app.add_keymap("s", lambda: app.start_grep(True))
     app.add_keymap("S", lambda: app.start_grep(False))
 
