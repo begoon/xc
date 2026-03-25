@@ -36,7 +36,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-VERSION = "0.2.5"
+VERSION = "0.2.6"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -231,6 +231,17 @@ def render_file(f: VFile, width: int, dir_size: int = -1) -> str:
 
 def sort_files(files: list[VFile]) -> list[VFile]:
     return sorted(files, key=lambda f: (not f.is_dir(), f.name))
+
+
+def _expand_home(path: str) -> str:
+    """Expand ~, $HOME, and $(HOME) prefixes in *path*."""
+    home = os.path.expanduser("~")
+    for prefix in ("$(HOME)", "$HOME"):
+        if path == prefix:
+            return home
+        if path.startswith(prefix + "/") or path.startswith(prefix + os.sep):
+            return home + path[len(prefix) :]
+    return os.path.expanduser(path)
 
 
 # ---------------------------------------------------------------------------
@@ -742,9 +753,11 @@ class GCSFS(VFS):
                     key = line[len("key=") :]
         if not bucket_name:
             raise OSError(f"no bucket specified in {filename}")
-        if key and not os.path.isabs(key):
-            base = cwd if cwd else os.path.dirname(filename)
-            key = os.path.join(base, key)
+        if key:
+            key = _expand_home(key)
+            if not os.path.isabs(key):
+                base = cwd if cwd else os.path.dirname(filename)
+                key = os.path.join(base, key)
         from google.cloud import storage as gcs_storage
 
         kwargs: dict = {}
@@ -971,7 +984,7 @@ class SSHFS(VFS):
         fs.user = user
         fs.port = port
         if identity:
-            fs.identity = os.path.expanduser(identity)
+            fs.identity = _expand_home(identity)
         fs._control_path = os.path.join(
             tempfile.gettempdir(),
             f"xc-ssh-{user or 'default'}-{host}-{port or '22'}",
