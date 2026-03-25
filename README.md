@@ -236,7 +236,7 @@ bucket=my-analytics-bucket
 key=service-account.json
 ```
 
-The `key` path can be relative (resolved from the active panel's current directory) or absolute. If omitted, application default credentials are used.
+The `key` path can be relative (resolved from the active panel's current directory), absolute, or use `~`, `$HOME`, or `$(HOME)` to refer to the home directory. If omitted, application default credentials are used.
 
 **SSH example** (`prod.ssh`):
 
@@ -248,7 +248,7 @@ identity=~/.ssh/id_ed25519
 port=22
 ```
 
-Only `host` is required. All other fields are optional -- SSH will pick them up from `~/.ssh/config`. The `host` value can be an SSH config alias.
+Only `host` is required. All other fields are optional -- SSH will pick them up from `~/.ssh/config`. The `host` value can be an SSH config alias. The `identity` path supports `~`, `$HOME`, and `$(HOME)` prefixes.
 
 ### Remote file editing
 
