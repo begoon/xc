@@ -36,7 +36,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-VERSION = "0.2.8"
+VERSION = "0.2.9"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -350,7 +350,15 @@ class TarFS(VFS):
         lower = filename.lower()
         return any(
             lower.endswith(ext)
-            for ext in (".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2")
+            for ext in (
+                ".tar",
+                ".tar.gz",
+                ".tgz",
+                ".tar.bz2",
+                ".tbz2",
+                ".tar.xz",
+                ".txz",
+            )
         )
 
     def enter(self, header: bytes, filename: str, cwd: str = "") -> VFS:
@@ -360,6 +368,8 @@ class TarFS(VFS):
             mode = "r:gz"
         elif lower.endswith(".bz2") or lower.endswith(".tbz2"):
             mode = "r:bz2"
+        elif lower.endswith(".xz") or lower.endswith(".txz"):
+            mode = "r:xz"
         tf = tarfile.open(filename, mode)
         dirs: dict[str, list[VFile]] = {}
         seen: set[str] = set()
