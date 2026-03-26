@@ -36,7 +36,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-VERSION = "0.2.7"
+VERSION = "0.2.8"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -1554,6 +1554,8 @@ class App:
         self.prompt_cursor = 0
         self.prompt_action: Callable[[str], None] | None = None
         self.err_msg = ""
+        self.ctrl_c_pending = False
+        self.help_mode = False
         self.cursor_pos: tuple[int, int] | None = None  # (y, x) for cursor
 
         local_fs = LocalFS()
@@ -2435,6 +2437,8 @@ class App:
             self.draw_copy_history(w, h)
         if self.cmd_hist_mode:
             self.draw_cmd_history(w, h)
+        if self.help_mode:
+            self.draw_help()
 
         if self.cursor_pos:
             curses.curs_set(1)
@@ -2726,6 +2730,68 @@ class App:
             self.draw_string(
                 0, row_y, " " + self.cmd_history[idx], screen_w, style
             )
+
+    def draw_help(self) -> None:
+        lines = [
+            "Navigation",
+            "  ↑/↓  k/j     move cursor",
+            "  Enter         enter directory / open file",
+            "  Backspace     go to parent directory",
+            "  Tab           switch panel",
+            "  PgUp/PgDn     page up / page down",
+            "  Home/End      first / last file",
+            "  Space         tag file",
+            "  +/_           tag all / untag all",
+            "",
+            "Menus",
+            "  x             command menu",
+            "  e             editor menu",
+            "  v             view menu",
+            "  b             bookmark menu",
+            "  r             remotes",
+            "",
+            "Commands",
+            "  ;             command line (shell)",
+            "  :             command line (internal)",
+            "  s/S           grep (recursive / current dir)",
+            "  /             search in file list",
+            "  i             calculate directory sizes",
+            "",
+            "Other",
+            "  ESC ESC       show main screen",
+            "  Ctrl-L        reload panel",
+            "  Ctrl-C ×2     quit",
+            "  q             quit",
+            "  h             this help",
+        ]
+        h, w = self.scr.getmaxyx()
+        box_w = max(len(line) for line in lines) + 6
+        box_h = len(lines) + 4
+        x0 = (w - box_w) // 2
+        y0 = (h - box_h) // 2
+        attr = curses.color_pair(CP_MENU)
+        attr_title = curses.color_pair(CP_MENU) | curses.A_BOLD
+        attr_border = curses.color_pair(CP_BORDER)
+        # fill background
+        for dy in range(box_h):
+            self.draw_string(x0, y0 + dy, "", box_w, attr)
+        # border
+        self.set_cell(x0, y0, curses.ACS_ULCORNER, attr_border)
+        self.set_cell(x0 + box_w - 1, y0, curses.ACS_URCORNER, attr_border)
+        self.set_cell(x0, y0 + box_h - 1, curses.ACS_LLCORNER, attr_border)
+        self.set_cell(
+            x0 + box_w - 1, y0 + box_h - 1, curses.ACS_LRCORNER, attr_border
+        )
+        for i in range(1, box_w - 1):
+            self.set_cell(x0 + i, y0, curses.ACS_HLINE, attr_border)
+            self.set_cell(x0 + i, y0 + box_h - 1, curses.ACS_HLINE, attr_border)
+        for i in range(1, box_h - 1):
+            self.set_cell(x0, y0 + i, curses.ACS_VLINE, attr_border)
+            self.set_cell(x0 + box_w - 1, y0 + i, curses.ACS_VLINE, attr_border)
+        # content
+        for i, line in enumerate(lines):
+            a = attr_title if line and not line.startswith(" ") else attr
+            self.draw_string(x0 + 3, y0 + 2 + i, line, box_w - 6, a)
 
     # -- Key handling --
 
@@ -3114,6 +3180,9 @@ class App:
                 p.move_to(len(p.files) - 1)
 
     def handle_key(self, key: int) -> None:
+        if self.help_mode:
+            self.help_mode = False
+            return
         if self.menu_active:
             self.handle_menu_key(key)
             return
@@ -3209,9 +3278,7 @@ class App:
             elif ch == "j":
                 p.move_to(p.cursor + 1)
             elif ch == "h":
-                self.active = 0
-            elif ch == "l":
-                self.active = 1
+                self.help_mode = True
             elif ch == "^":
                 p.move_to(0)
             elif ch == "G":
@@ -3248,6 +3315,15 @@ class App:
                 continue
             if isinstance(key, str):
                 key = ord(key)
+            if key == 3:  # Ctrl-C
+                if self.ctrl_c_pending:
+                    break
+                self.ctrl_c_pending = True
+                self.err_msg = "press Ctrl-C again to terminate"
+                continue
+            if self.ctrl_c_pending:
+                self.ctrl_c_pending = False
+                self.err_msg = ""
             self.handle_key(key)
 
 
