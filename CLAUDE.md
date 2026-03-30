@@ -8,7 +8,7 @@ Single-file Python two-panel file manager with virtual filesystem support.
 
 ## Architecture
 
-- **VFS layer**: Abstract `VFS` base class with implementations: `LocalFS`, `TarFS`, `S3FS`, `GCSFS`, `SSHFS`
+- **VFS layer**: Abstract `VFS` base class with implementations: `LocalFS`, `TarFS`, `S3FS`, `GCSFS`, `SSHFS`, `GrepFS`
 - **Panel**: File list panel with VFS stack for nested navigation
 - **App**: Top-level curses app managing two panels, menus, commands, keymaps
 
@@ -29,6 +29,18 @@ Detection is probe-based: iterate `probes` list, first match wins. Add new VFS t
 - ESC ESC in panel mode (or Ctrl-O) switches to main screen to review command output
 - ESC (or Ctrl-O) in main screen returns to panels
 - Bare ESC detection uses `select()` with 50ms timeout to distinguish from escape sequences
+
+### GrepFS
+
+- Flat list VFS showing search results as relative paths in a single level
+- `add_path()` appends results incrementally; panel redraws live during search
+- ESC during search keeps partial results; ENTER on a result leaves GrepFS and navigates to that file's directory with cursor on the file
+- Rendered via `render_grep_result()`: paths truncated from the left with `...` if too wide
+
+### Name truncation
+
+- `shorten_name()` truncates long names as `beginning~.ext` (or `beginning~last3` if no extension)
+- Used by `pad_or_truncate()` in panel file rows and by `draw_status_line()` for the file name
 
 ### Dimmed files
 
