@@ -1,5 +1,8 @@
 default: install
 
+run:
+    uv run ./xc.py
+
 lint:
     bunx markdownlint-cli --disable line-length -- **/README.md
 

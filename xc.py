@@ -7,6 +7,7 @@
 # ]
 # ///
 """xc - two-panel console file manager."""
+
 from __future__ import annotations
 
 import bz2
@@ -23,10 +24,10 @@ import shutil
 import stat
 import subprocess
 import sys
-import time
 import tarfile
 import tempfile
 import termios
+import time
 import tty
 import urllib.request
 import zipfile
@@ -36,7 +37,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-VERSION = "0.2.9"
+VERSION = "0.2.10"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -186,13 +187,24 @@ def format_size(size: int) -> str:
     return f"{size / (1024 * 1024 * 1024):.1f}G"
 
 
+def shorten_name(s: str, width: int) -> str:
+    """Shorten to width: beginning~.ext or beginning~last3 if no ext."""
+    if len(s) <= width:
+        return s
+    if width <= 4:
+        return s[:width]
+    _, ext = os.path.splitext(s.rstrip("/"))
+    trail = "/" if s.endswith("/") else ""
+    suffix = (ext + trail) if ext else s[-3:]
+    if 1 + 1 + len(suffix) > width:
+        return s[: width - 1] + "~"
+    avail = width - 1 - len(suffix)
+    return s[:avail] + "~" + suffix
+
+
 def pad_or_truncate(s: str, width: int) -> str:
-    runes = list(s)
-    if len(runes) > width:
-        if width > 1:
-            return "".join(runes[: width - 1]) + "~"
-        return "".join(runes[:width])
-    return s + " " * (width - len(runes))
+    s = shorten_name(s, width)
+    return s + " " * (width - len(s))
 
 
 def render_file(f: VFile, width: int, dir_size: int = -1) -> str:
@@ -227,6 +239,18 @@ def render_file(f: VFile, width: int, dir_size: int = -1) -> str:
             prefix = "*"
 
     return prefix + name_ext + " " + size_str + " " + date_str
+
+
+def render_grep_result(f: VFile, width: int) -> str:
+    name = f.name
+    if f.is_dir():
+        name += "/"
+    if len(name) > width:
+        if width > 3:
+            name = "..." + name[-(width - 3) :]
+        else:
+            name = name[-width:]
+    return name + " " * max(0, width - len(name))
 
 
 def sort_files(files: list[VFile]) -> list[VFile]:
@@ -1061,7 +1085,7 @@ class GrepFS(VFS):
     label = "GREP"
 
     def __init__(self) -> None:
-        self.dirs: dict[str, list[VFile]] | None = None
+        self.results: list[VFile] = []
         self.base_dir: str = ""
 
     def probe(self, header: bytes, filename: str) -> bool:
@@ -1070,66 +1094,24 @@ class GrepFS(VFS):
     def enter(self, header: bytes, filename: str, cwd: str = "") -> VFS:
         raise OSError("GrepFS cannot be entered via probe")
 
-    def build_from_paths(self, base_dir: str, paths: list[str]) -> None:
-        self.base_dir = base_dir
-        dirs: dict[str, list[VFile]] = {}
-        seen_dirs: set[str] = set()
-
-        def ensure_dir(dir_path: str) -> None:
-            if not dir_path or dir_path in seen_dirs:
-                return
-            seen_dirs.add(dir_path)
-            parent = os.path.dirname(dir_path)
-            if parent == dir_path:
-                return
-            name = os.path.basename(dir_path)
-            ensure_dir(parent)
-            pk = parent
-            if pk not in dirs:
-                dirs[pk] = []
-            if not any(f.name == name for f in dirs[pk]):
-                dirs[pk].append(VFile(name=name, file_type=FILE_TYPE_DIR))
-
-        for rel in paths:
-            rel = rel.lstrip("./")
-            if not rel:
-                continue
-            d = os.path.dirname(rel)
-            name = os.path.basename(rel)
-            ensure_dir(d)
-            dk = d
-            if dk not in dirs:
-                dirs[dk] = []
-            full = os.path.join(base_dir, rel)
-            try:
-                st = os.stat(full)
-                ft = (
-                    FILE_TYPE_DIR
-                    if stat.S_ISDIR(st.st_mode)
-                    else FILE_TYPE_FILE
-                )
-                vf = VFile(
-                    name=name,
-                    size=st.st_size,
-                    file_type=ft,
-                    mod_time=st.st_mtime,
-                    executable=ft == FILE_TYPE_FILE
-                    and bool(st.st_mode & 0o111),
-                )
-            except OSError:
-                vf = VFile(name=name)
-            dirs[dk].append(vf)
-
-        for d in dirs:
-            dirs[d] = sort_files(dirs[d])
-        self.dirs = dirs
+    def add_path(self, rel_path: str) -> None:
+        full = os.path.join(self.base_dir, rel_path)
+        try:
+            st = os.stat(full)
+            ft = FILE_TYPE_DIR if stat.S_ISDIR(st.st_mode) else FILE_TYPE_FILE
+            vf = VFile(
+                name=rel_path,
+                size=st.st_size,
+                file_type=ft,
+                mod_time=st.st_mtime,
+                executable=ft == FILE_TYPE_FILE and bool(st.st_mode & 0o111),
+            )
+        except OSError:
+            vf = VFile(name=rel_path)
+        self.results.append(vf)
 
     def read_dir(self, path: str) -> list[VFile]:
-        if self.dirs is None:
-            raise OSError("grep results not loaded")
-        if path not in self.dirs:
-            raise OSError(f"directory not found: {path}")
-        return self.dirs[path]
+        return list(self.results)
 
     def read_file(self, path: str) -> io.IOBase:
         full = os.path.join(self.base_dir, path)
@@ -1142,7 +1124,7 @@ class GrepFS(VFS):
         raise OSError("GrepFS is read-only")
 
     def leave(self) -> None:
-        self.dirs = None
+        self.results = []
         self.base_dir = ""
 
 
@@ -1214,6 +1196,23 @@ class Panel:
         f = self.files[self.cursor]
         if f.name == "..":
             self.go_up()
+            return
+        if isinstance(self.fs, GrepFS):
+            rel_path = f.name
+            base_dir = self.fs.base_dir
+            self.fs.leave()
+            prev = self.stack.pop()
+            self.fs = prev.fs
+            target_dir = os.path.join(base_dir, os.path.dirname(rel_path))
+            target_name = os.path.basename(rel_path)
+            self.path = target_dir
+            self.cursor = 0
+            self.offset = 0
+            self.load_dir()
+            for i, ff in enumerate(self.files):
+                if ff.name == target_name:
+                    self.cursor = i
+                    break
             return
         if f.is_dir():
             self.path = os.path.join(self.path, f.name)
@@ -1644,7 +1643,10 @@ class App:
     # -- Prompt --
 
     def show_prompt(
-        self, label: str, initial: str, action: Callable[[str], None]
+        self,
+        label: str,
+        initial: str,
+        action: Callable[[str], None],
     ) -> None:
         self.prompt_mode = True
         self.prompt_label = label
@@ -1778,64 +1780,8 @@ class App:
         base_dir = p.path
         self.grep_mode = 0
 
-        paths: list[str] = []
-        cancelled = False
-        frame = 0
-        last_spin = 0.0
-        self.scr.nodelay(True)
-        try:
-            for dirpath, dirnames, filenames in os.walk(base_dir):
-                # Skip hidden directories
-                dirnames[:] = [d for d in dirnames if not d.startswith(".")]
-                now = time.monotonic()
-                if now - last_spin >= 0.1:
-                    if self.spinner_check_esc(frame):
-                        cancelled = True
-                        break
-                    frame += 1
-                    last_spin = now
-                for name in filenames:
-                    if file_pat and not fnmatch.fnmatch(name, file_pat):
-                        continue
-                    full = os.path.join(dirpath, name)
-                    rel = os.path.relpath(full, base_dir)
-                    if not search_str:
-                        paths.append(rel)
-                        continue
-                    try:
-                        with open(full, "rb") as f:
-                            chunk = f.read(8192)
-                            if b"\x00" in chunk:
-                                continue  # skip binary
-                            text = chunk
-                            rest = f.read()
-                            if rest:
-                                text += rest
-                        content = text.decode("utf-8", errors="ignore")
-                        if self.grep_sensitive:
-                            if search_str in content:
-                                paths.append(rel)
-                        else:
-                            if search_str.lower() in content.lower():
-                                paths.append(rel)
-                    except (OSError, PermissionError):
-                        continue
-        except Exception as e:
-            self.set_error(str(e))
-            return
-        finally:
-            self.scr.nodelay(False)
-
-        if cancelled:
-            self.set_error("search cancelled")
-            return
-
-        if not paths:
-            self.set_error("no matches found")
-            return
-
         gfs = GrepFS()
-        gfs.build_from_paths(base_dir, paths)
+        gfs.base_dir = base_dir
         p.stack.append(
             VFSEntry(
                 fs=p.fs,
@@ -1850,7 +1796,71 @@ class App:
         p.cursor = 0
         p.offset = 0
         p.tagged = {}
+        p.files = [VFile(name="..", file_type=FILE_TYPE_DIR)]
+
+        frame = 0
+        last_spin = 0.0
+        cancelled = False
+        self.scr.nodelay(True)
+        try:
+            for dirpath, dirnames, filenames in os.walk(base_dir):
+                # Skip hidden directories
+                dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+                now = time.monotonic()
+                if now - last_spin >= 0.1:
+                    p.files = [
+                        VFile(name="..", file_type=FILE_TYPE_DIR)
+                    ] + gfs.results
+                    self.draw()
+                    if self.spinner_check_esc(frame):
+                        cancelled = True
+                        break
+                    frame += 1
+                    last_spin = now
+                for name in filenames:
+                    if file_pat and not fnmatch.fnmatch(name, file_pat):
+                        continue
+                    full = os.path.join(dirpath, name)
+                    rel = os.path.relpath(full, base_dir)
+                    if not search_str:
+                        gfs.add_path(rel)
+                        continue
+                    try:
+                        with open(full, "rb") as f:
+                            chunk = f.read(8192)
+                            if b"\x00" in chunk:
+                                continue  # skip binary
+                            text = chunk
+                            rest = f.read()
+                            if rest:
+                                text += rest
+                        content = text.decode("utf-8", errors="ignore")
+                        if self.grep_sensitive:
+                            if search_str in content:
+                                gfs.add_path(rel)
+                        else:
+                            if search_str.lower() in content.lower():
+                                gfs.add_path(rel)
+                    except (OSError, PermissionError):
+                        continue
+        except Exception as e:
+            self.set_error(str(e))
+        finally:
+            self.scr.nodelay(False)
+
         p.load_dir()
+
+        if not gfs.results:
+            gfs.leave()
+            prev = p.stack.pop()
+            p.fs = prev.fs
+            p.path = prev.path
+            p.cursor = prev.cursor
+            p.offset = prev.offset
+            p.load_dir()
+            self.set_error("no matches found")
+        elif cancelled:
+            self.set_error(f"search stopped, {len(gfs.results)} matches")
 
     # -- Actions --
 
@@ -1966,7 +1976,7 @@ class App:
         p = self.panels[self.active]
         if p.tagged:
             self.show_prompt(
-                f"Delete {len(p.tagged)} files? (y/n): ",
+                f"DELETE {len(p.tagged)} files? (y/n): ",
                 "",
                 lambda ans: self._do_remove_tagged(ans),
             )
@@ -1975,7 +1985,7 @@ class App:
             if f and f.name != "..":
                 name = f.name
                 self.show_prompt(
-                    f"Delete {name}? (y/n): ",
+                    f"DELETE {name}? (y/n): ",
                     "",
                     lambda ans, n=name: self._do_remove_single(ans, n),
                 )
@@ -2502,8 +2512,11 @@ class App:
 
             if file_idx < len(p.files):
                 f = p.files[file_idx]
-                dir_size = p.dir_sizes.get(f.name, -1)
-                line = render_file(f, inner_w, dir_size)
+                if isinstance(p.fs, GrepFS) and f.name != "..":
+                    line = render_grep_result(f, inner_w)
+                else:
+                    dir_size = p.dir_sizes.get(f.name, -1)
+                    line = render_file(f, inner_w, dir_size)
                 tagged = p.tagged.get(f.name, False)
                 if tagged:
                     chars = list(line)
@@ -2586,7 +2599,11 @@ class App:
                 dt = datetime.fromtimestamp(info.st_mtime).strftime(
                     "%Y-%m-%d %H:%M:%S"
                 )
-                parts.append(f"{mode} {nlinks} {info.st_size} {dt} {f.name}")
+                prefix = f"{mode} {nlinks} {info.st_size} {dt} "
+                prior = " ".join(parts) + " " if parts else ""
+                avail = w - len(prior) - len(prefix)
+                name = shorten_name(f.name, max(avail, 1))
+                parts.append(prefix + name)
             except OSError:
                 pass
         else:
@@ -2596,7 +2613,11 @@ class App:
                 if f.mod_time
                 else ""
             )
-            parts.append(f"{type_str} {format_size(f.size)} {dt} {f.name}")
+            prefix = f"{type_str} {format_size(f.size)} {dt} "
+            prior = " ".join(parts) + " " if parts else ""
+            avail = w - len(prior) - len(prefix)
+            name = shorten_name(f.name, max(avail, 1))
+            parts.append(prefix + name)
         self.draw_string(x, y, " ".join(parts), w, attr)
 
     def draw_cmd_line(self, x: int, y: int, w: int) -> None:
