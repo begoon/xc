@@ -8,7 +8,7 @@ Single-file Python two-panel file manager with virtual filesystem support.
 
 ## Architecture
 
-- **VFS layer**: Abstract `VFS` base class with implementations: `LocalFS`, `TarFS`, `S3FS`, `GCSFS`, `SSHFS`, `GrepFS`
+- **VFS layer**: Abstract `VFS` base class with implementations: `LocalFS`, `TarFS`, `S3FS`, `GCSFS`, `OCIFS`, `GDriveFS`, `SSHFS`, `GrepFS`
 - **Panel**: File list panel with VFS stack for nested navigation
 - **App**: Top-level curses app managing two panels, menus, commands, keymaps
 
@@ -19,9 +19,25 @@ Detection is probe-based: iterate `probes` list, first match wins. Add new VFS t
 
 ### Key conventions
 
-- VFS config files: `.s3`, `.gcs`, `.ssh` extensions with key=value content
+- VFS config files: `.s3`, `.gcs`, `.oci`, `.gdrive`, `.ssh` extensions with key=value content
 - Macro expansion: `%f` (filename), `%F` (full path), `%x`/`%X` (without extension), `%m`/`%M` (tagged files), `%d`/`%D` (directory), `%&` (background)
 - `%F` on non-local VFS: downloads to temp, runs command, uploads back on success if file changed
+
+### OCIFS
+
+- OCI Object Storage VFS, config extension `.oci`
+- Config keys: `type=oci`, `bucket`, `OCI_BUCKET_NAMESPACE`, `OCI_USER`, `OCI_FINGERPRINT`, `OCI_TENANCY`, `OCI_REGION`, `OCI_KEY_BASE64` (inline base64 PEM) or `OCI_KEY_FILE` (path to PEM)
+- Falls back to `oci.config.from_file()` if no key provided
+- Uses `oci` SDK, pagination via `next_start_with`
+
+### GDriveFS
+
+- Google Drive VFS, config extension `.gdrive`
+- Config keys: `type=gdrive`, `folder` (root folder ID), `key` (service account JSON path)
+- Falls back to `google.auth.default()` if no key provided
+- Uses `google-api-python-client` Drive API v3
+- Caches folder ID lookups in `_id_cache` (path -> ID mapping)
+- All API calls use `supportsAllDrives=True` and `includeItemsFromAllDrives=True` for shared/team drives
 
 ### Screen switching
 

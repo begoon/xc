@@ -9,7 +9,7 @@ A two-panel console file manager inspired by Midnight Commander, written in Pyth
 The Python version of xc is a single self-contained script (`xc.py`) that runs via [uv](https://docs.astral.sh/uv/). This means:
 
 - **Zero setup** -- no virtualenv, no `pip install`, no `requirements.txt`. Just run `uv run xc.py`.
-- **Inline dependencies** -- the script header declares its own dependencies (`boto3`, `google-cloud-storage`), and uv resolves and caches them automatically on the first run.
+- **Inline dependencies** -- the script header declares its own dependencies (`boto3`, `google-cloud-storage`, `oci`, `google-api-python-client`), and uv resolves and caches them automatically on the first run.
 - **Reproducible** -- uv pins the Python version (`>=3.11`) and handles isolation, so the script works the same way on any machine.
 - **Single file to deploy** -- copy `xc.py` to a server, a dotfiles repo, or a USB stick. There is nothing else to carry.
 
@@ -114,7 +114,7 @@ Press `b` to open the **bookmark** menu for quick jumps to common directories (h
 
 ### Remotes (`r`)
 
-Press `r` to open the **remote** menu. This scans `~/.xc/remotes/` for VFS config files (`.s3`, `.gcs`, `.ssh`) and presents them as a selector. Choosing a remote opens it on the active panel, just like pressing `Enter` on a VFS config file.
+Press `r` to open the **remote** menu. This scans `~/.xc/remotes/` for VFS config files (`.s3`, `.gcs`, `.oci`, `.gdrive`, `.ssh`) and presents them as a selector. Choosing a remote opens it on the active panel, just like pressing `Enter` on a VFS config file.
 
 This lets you keep all your remote connections in one place and access them from any directory without navigating to where the config files live.
 
@@ -124,12 +124,14 @@ Example setup:
 ~/.xc/remotes/
   production.s3
   analytics.gcs
+  storage.oci
+  shared-drive.gdrive
   webserver.ssh
 ```
 
 ### Editor (`e`) and view (`v`)
 
-Press `e` to open a file in an editor, or `v` to view it. These menus launch external commands with the current file path substituted via macros (see below). On remote VFS (SSH, S3, GCS), the file is automatically downloaded to a temp location, opened locally, and uploaded back if modified.
+Press `e` to open a file in an editor, or `v` to view it. These menus launch external commands with the current file path substituted via macros (see below). On remote VFS (SSH, S3, GCS, OCI, GDrive), the file is automatically downloaded to a temp location, opened locally, and uploaded back if modified.
 
 ### Running shell commands
 
@@ -205,28 +207,29 @@ There is no config file on purpose. The script **is** the config.
 
 Entering certain files opens them as virtual directories:
 
-| Extension                                    | VFS  | Description                         |
-| -------------------------------------------- | ---- | ----------------------------------- |
-| `.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`        | TAR  | Browse tar archives                 |
-| `.zip`                                       | ZIP  | Browse zip archives                 |
-| `.gz`, `.bz2`, `.xz`, `.lzma`               | -    | View compressed single files        |
-| `.s3`                                        | S3   | Browse Amazon S3 buckets            |
-| `.gcs`                                       | GCS  | Browse Google Cloud Storage buckets |
-| `.ssh`                                       | SSH  | Browse remote servers over SSH      |
+| Extension                                    | VFS    | Description                         |
+| -------------------------------------------- | ------ | ----------------------------------- |
+| `.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`        | TAR    | Browse tar archives                 |
+| `.zip`                                       | ZIP    | Browse zip archives                 |
+| `.gz`, `.bz2`, `.xz`, `.lzma`               | -      | View compressed single files        |
+| `.s3`                                        | S3     | Browse Amazon S3 buckets            |
+| `.gcs`                                       | GCS    | Browse Google Cloud Storage buckets |
+| `.oci`                                       | OCI    | Browse Oracle Cloud Object Storage  |
+| `.gdrive`                                    | GDrive | Browse Google Drive folders         |
+| `.ssh`                                       | SSH    | Browse remote servers over SSH      |
 
-VFS config files (`.s3`, `.gcs`, `.ssh`) are simple `key=value` text files. The path header shows the VFS type, e.g. `~/servers/prod.ssh (SSH)`.
+VFS config files (`.s3`, `.gcs`, `.oci`, `.gdrive`, `.ssh`) are simple `key=value` text files. The path header shows the VFS type, e.g. `~/servers/prod.ssh (SSH)`.
 
 **S3 example** (`production.s3`):
 
 ```text
 type=s3
 bucket=my-data-bucket
-AWS_ACCESS_KEY_ID=AKIA...
-AWS_SECRET_ACCESS_KEY=...
+AWS_PROFILE=production
 AWS_REGION=eu-west-1
 ```
 
-If credentials are omitted, the default AWS credential chain is used.
+`AWS_PROFILE` selects a named profile from `~/.aws/credentials`. You can also specify `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` inline, but using a profile is recommended. If all credentials are omitted, the default AWS credential chain is used.
 
 **GCS example** (`analytics.gcs`):
 
@@ -237,6 +240,31 @@ key=service-account.json
 ```
 
 The `key` path can be relative (resolved from the active panel's current directory), absolute, or use `~`, `$HOME`, or `$(HOME)` to refer to the home directory. If omitted, application default credentials are used.
+
+**OCI example** (`storage.oci`):
+
+```text
+type=oci
+bucket=my-bucket
+OCI_BUCKET_NAMESPACE=mynamespace
+OCI_USER=ocid1.user.oc1..aaa...
+OCI_FINGERPRINT=aa:bb:cc:...
+OCI_TENANCY=ocid1.tenancy.oc1..aaa...
+OCI_REGION=uk-london-1
+OCI_KEY_FILE=my-key.pem
+```
+
+`OCI_KEY_FILE` is a path to a PEM private key file. Alternatively, use `OCI_KEY_BASE64` to embed the key inline as base64. If neither is provided, the default OCI config (`~/.oci/config`) is used.
+
+**Google Drive example** (`shared.gdrive`):
+
+```text
+type=gdrive
+folder=1Z_NJ0-LAPzaO7eursL92DWPmFKQT3lpK
+key=service-account.json
+```
+
+The `folder` is the ID from the Google Drive folder URL. The `key` path points to a service account JSON credentials file (relative paths are resolved from the config file's directory). If omitted, application default credentials are used. Shared drives and folders shared from other accounts are supported.
 
 **SSH example** (`prod.ssh`):
 
@@ -252,7 +280,7 @@ Only `host` is required. All other fields are optional -- SSH will pick them up 
 
 ### Remote file editing
 
-The `%F` macro works transparently on remote VFS (SSH, S3, GCS). When you run a command like `vi %F` on a remote file, xc automatically:
+The `%F` macro works transparently on remote VFS (SSH, S3, GCS, OCI, GDrive). When you run a command like `vi %F` on a remote file, xc automatically:
 
 1. Downloads the file to a local temp location
 2. Runs the command against the local copy

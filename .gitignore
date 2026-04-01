@@ -3,6 +3,10 @@
 xc
 *.gcs
 *.s3
+*.oci
+*.gdrive
 *.ssh
+remotes/keys/*.*
 
 __pycache__
+*.key

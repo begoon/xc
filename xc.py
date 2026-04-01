@@ -4,6 +4,9 @@
 # dependencies = [
 #   "boto3",
 #   "google-cloud-storage",
+#   "oci",
+#   "google-api-python-client",
+#   "google-auth",
 # ]
 # ///
 """xc - two-panel console file manager."""
@@ -37,7 +40,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-VERSION = "0.2.10"
+VERSION = "0.2.11"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -684,7 +687,7 @@ class S3FS(VFS):
         return header.startswith(b"type=s3")
 
     def enter(self, header: bytes, filename: str, cwd: str = "") -> VFS:
-        bucket = access_key = secret_key = region = ""
+        bucket = access_key = secret_key = region = profile = ""
         with open(filename) as f:
             for line in f:
                 line = line.strip()
@@ -698,17 +701,23 @@ class S3FS(VFS):
                     secret_key = line[len("AWS_SECRET_ACCESS_KEY=") :]
                 elif line.startswith("AWS_REGION="):
                     region = line[len("AWS_REGION=") :]
+                elif line.startswith("AWS_PROFILE="):
+                    profile = line[len("AWS_PROFILE=") :]
         if not bucket:
             raise OSError(f"no bucket specified in {filename}")
         if not region:
             region = "us-east-1"
         import boto3
 
+        session_kwargs: dict = {}
+        if profile:
+            session_kwargs["profile_name"] = profile
+        session = boto3.Session(**session_kwargs)
         kwargs: dict = {"region_name": region}
         if access_key and secret_key:
             kwargs["aws_access_key_id"] = access_key
             kwargs["aws_secret_access_key"] = secret_key
-        client = boto3.client("s3", **kwargs)
+        client = session.client("s3", **kwargs)
         fs = S3FS()
         fs.client = client
         fs.bucket = bucket
@@ -851,6 +860,379 @@ class GCSFS(VFS):
         if self.client:
             self.client.close()
             self.client = None
+
+
+class OCIFS(VFS):
+    label = "OCI"
+
+    def __init__(self) -> None:
+        self.client = None
+        self.bucket = ""
+        self.namespace = ""
+
+    def probe(self, header: bytes, filename: str) -> bool:
+        if not filename.lower().endswith(".oci"):
+            return False
+        return header.startswith(b"type=oci")
+
+    def enter(self, header: bytes, filename: str, cwd: str = "") -> VFS:
+        bucket = namespace = user = fingerprint = tenancy = region = ""
+        key_base64 = key_file = ""
+        with open(filename) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("bucket="):
+                    bucket = line[len("bucket=") :]
+                elif line.startswith("OCI_BUCKET_NAMESPACE="):
+                    namespace = line[len("OCI_BUCKET_NAMESPACE=") :]
+                elif line.startswith("OCI_USER="):
+                    user = line[len("OCI_USER=") :]
+                elif line.startswith("OCI_FINGERPRINT="):
+                    fingerprint = line[len("OCI_FINGERPRINT=") :]
+                elif line.startswith("OCI_TENANCY="):
+                    tenancy = line[len("OCI_TENANCY=") :]
+                elif line.startswith("OCI_REGION="):
+                    region = line[len("OCI_REGION=") :]
+                elif line.startswith("OCI_KEY_BASE64="):
+                    key_base64 = line[len("OCI_KEY_BASE64=") :]
+                elif line.startswith("OCI_KEY_FILE="):
+                    key_file = line[len("OCI_KEY_FILE=") :]
+        if not bucket:
+            raise OSError(f"no bucket specified in {filename}")
+        if not namespace:
+            raise OSError(f"no namespace specified in {filename}")
+        import oci
+
+        if key_base64:
+            import base64
+
+            key_content = base64.b64decode(key_base64).decode()
+            config = {
+                "user": user,
+                "fingerprint": fingerprint,
+                "tenancy": tenancy,
+                "region": region,
+                "key_content": key_content,
+            }
+        elif key_file:
+            key_file = _expand_home(key_file)
+            if not os.path.isabs(key_file):
+                base = cwd if cwd else os.path.dirname(filename)
+                key_file = os.path.join(base, key_file)
+            config = {
+                "user": user,
+                "fingerprint": fingerprint,
+                "tenancy": tenancy,
+                "region": region,
+                "key_file": key_file,
+            }
+        else:
+            config = oci.config.from_file()
+        client = oci.object_storage.ObjectStorageClient(config)
+        fs = OCIFS()
+        fs.client = client
+        fs.bucket = bucket
+        fs.namespace = namespace
+        return fs
+
+    def read_dir(self, path: str) -> list[VFile]:
+        if not self.client:
+            raise OSError("OCI not connected")
+        prefix = path
+        if prefix and not prefix.endswith("/"):
+            prefix += "/"
+        files: list[VFile] = []
+        next_start = None
+        while True:
+            kwargs: dict = {
+                "namespace_name": self.namespace,
+                "bucket_name": self.bucket,
+                "prefix": prefix,
+                "delimiter": "/",
+                "fields": "name,size,timeModified",
+            }
+            if next_start:
+                kwargs["start"] = next_start
+            resp = self.client.list_objects(**kwargs)
+            data = resp.data
+            for pfx in data.prefixes or []:
+                name = pfx[len(prefix) :].rstrip("/")
+                if name:
+                    files.append(VFile(name=name, file_type=FILE_TYPE_DIR))
+            for obj in data.objects or []:
+                name = obj.name[len(prefix) :]
+                if not name:
+                    continue
+                ts = obj.time_modified.timestamp() if obj.time_modified else 0.0
+                files.append(VFile(name=name, size=obj.size or 0, mod_time=ts))
+            if data.next_start_with:
+                next_start = data.next_start_with
+            else:
+                break
+        return sort_files(files)
+
+    def read_file(self, path: str) -> io.IOBase:
+        if not self.client:
+            raise OSError("OCI not connected")
+        resp = self.client.get_object(self.namespace, self.bucket, path)
+        buf = io.BytesIO(resp.data.content)
+        return buf
+
+    def write_file(self, path: str, data: io.IOBase) -> None:
+        if not self.client:
+            raise OSError("OCI not connected")
+        body = data.read()
+        self.client.put_object(self.namespace, self.bucket, path, body)
+
+    def mkdir_all(self, path: str) -> None:
+        pass  # implicit in OCI Object Storage
+
+    def leave(self) -> None:
+        self.client = None
+
+
+class GDriveFS(VFS):
+    label = "GDrive"
+
+    def __init__(self) -> None:
+        self.service = None
+        self.root_folder_id = ""
+        self._id_cache: dict[str, str] = {}
+
+    def probe(self, header: bytes, filename: str) -> bool:
+        if not filename.lower().endswith(".gdrive"):
+            return False
+        return header.startswith(b"type=gdrive")
+
+    def enter(self, header: bytes, filename: str, cwd: str = "") -> VFS:
+        folder_id = key = ""
+        with open(filename) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("folder="):
+                    folder_id = line[len("folder=") :]
+                elif line.startswith("key="):
+                    key = line[len("key=") :]
+        if not folder_id:
+            raise OSError(f"no folder specified in {filename}")
+        if key:
+            key = _expand_home(key)
+            if not os.path.isabs(key):
+                base = cwd if cwd else os.path.dirname(filename)
+                key = os.path.join(base, key)
+        from googleapiclient.discovery import build
+
+        scopes = ["https://www.googleapis.com/auth/drive"]
+        if key:
+            from google.oauth2 import service_account
+
+            creds = service_account.Credentials.from_service_account_file(
+                key, scopes=scopes
+            )
+        else:
+            import google.auth
+
+            creds, _ = google.auth.default(scopes=scopes)
+        service = build("drive", "v3", credentials=creds)
+        fs = GDriveFS()
+        fs.service = service
+        fs.root_folder_id = folder_id
+        fs._id_cache = {"": folder_id}
+        return fs
+
+    def _resolve_id(self, path: str) -> str:
+        if path in self._id_cache:
+            return self._id_cache[path]
+        parts = path.strip("/").split("/")
+        current_path = ""
+        parent_id = self.root_folder_id
+        for part in parts:
+            current_path = f"{current_path}/{part}" if current_path else part
+            if current_path in self._id_cache:
+                parent_id = self._id_cache[current_path]
+                continue
+            escaped = part.replace("\\", "\\\\").replace("'", "\\'")
+            q = (
+                f"'{parent_id}' in parents"
+                f" and name = '{escaped}'"
+                f" and trashed = false"
+            )
+            resp = (
+                self.service.files()
+                .list(
+                    q=q,
+                    fields="files(id)",
+                    pageSize=1,
+                    supportsAllDrives=True,
+                    includeItemsFromAllDrives=True,
+                )
+                .execute()
+            )
+            files = resp.get("files", [])
+            if not files:
+                raise OSError(f"not found: {current_path}")
+            parent_id = files[0]["id"]
+            self._id_cache[current_path] = parent_id
+        return parent_id
+
+    def read_dir(self, path: str) -> list[VFile]:
+        if not self.service:
+            raise OSError("GDrive not connected")
+        folder_id = self._resolve_id(path)
+        q = f"'{folder_id}' in parents and trashed = false"
+        files: list[VFile] = []
+        page_token = None
+        while True:
+            resp = (
+                self.service.files()
+                .list(
+                    q=q,
+                    fields="nextPageToken, files(id, name, mimeType, size, modifiedTime)",
+                    pageSize=1000,
+                    pageToken=page_token,
+                    supportsAllDrives=True,
+                    includeItemsFromAllDrives=True,
+                )
+                .execute()
+            )
+            for item in resp.get("files", []):
+                name = item["name"]
+                child_path = f"{path}/{name}" if path else name
+                self._id_cache[child_path] = item["id"]
+                if item["mimeType"] == "application/vnd.google-apps.folder":
+                    files.append(VFile(name=name, file_type=FILE_TYPE_DIR))
+                else:
+                    size = int(item.get("size", 0))
+                    ts = 0.0
+                    mt = item.get("modifiedTime")
+                    if mt:
+                        from datetime import datetime
+
+                        ts = datetime.fromisoformat(
+                            mt.replace("Z", "+00:00")
+                        ).timestamp()
+                    files.append(VFile(name=name, size=size, mod_time=ts))
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+        return sort_files(files)
+
+    def read_file(self, path: str) -> io.IOBase:
+        if not self.service:
+            raise OSError("GDrive not connected")
+        file_id = self._resolve_id(path)
+        from googleapiclient.http import MediaIoBaseDownload
+
+        request = self.service.files().get_media(
+            fileId=file_id, supportsAllDrives=True
+        )
+        buf = io.BytesIO()
+        downloader = MediaIoBaseDownload(buf, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        buf.seek(0)
+        return buf
+
+    def write_file(self, path: str, data: io.IOBase) -> None:
+        if not self.service:
+            raise OSError("GDrive not connected")
+        parts = path.rsplit("/", 1)
+        if len(parts) == 2:
+            parent_path, name = parts
+        else:
+            parent_path, name = "", parts[0]
+        parent_id = self._resolve_id(parent_path)
+        escaped = name.replace("\\", "\\\\").replace("'", "\\'")
+        q = (
+            f"'{parent_id}' in parents"
+            f" and name = '{escaped}'"
+            f" and trashed = false"
+        )
+        resp = (
+            self.service.files()
+            .list(
+                q=q,
+                fields="files(id)",
+                pageSize=1,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            )
+            .execute()
+        )
+        existing = resp.get("files", [])
+        from googleapiclient.http import MediaIoBaseUpload
+
+        media = MediaIoBaseUpload(
+            data, mimetype="application/octet-stream", resumable=True
+        )
+        if existing:
+            self.service.files().update(
+                fileId=existing[0]["id"],
+                media_body=media,
+                supportsAllDrives=True,
+            ).execute()
+        else:
+            metadata = {"name": name, "parents": [parent_id]}
+            self.service.files().create(
+                body=metadata,
+                media_body=media,
+                supportsAllDrives=True,
+            ).execute()
+
+    def mkdir_all(self, path: str) -> None:
+        if not self.service:
+            raise OSError("GDrive not connected")
+        parts = path.strip("/").split("/")
+        current_path = ""
+        parent_id = self.root_folder_id
+        for part in parts:
+            current_path = f"{current_path}/{part}" if current_path else part
+            if current_path in self._id_cache:
+                parent_id = self._id_cache[current_path]
+                continue
+            escaped = part.replace("\\", "\\\\").replace("'", "\\'")
+            q = (
+                f"'{parent_id}' in parents"
+                f" and name = '{escaped}'"
+                f" and mimeType = 'application/vnd.google-apps.folder'"
+                f" and trashed = false"
+            )
+            resp = (
+                self.service.files()
+                .list(
+                    q=q,
+                    fields="files(id)",
+                    pageSize=1,
+                    supportsAllDrives=True,
+                    includeItemsFromAllDrives=True,
+                )
+                .execute()
+            )
+            existing = resp.get("files", [])
+            if existing:
+                parent_id = existing[0]["id"]
+            else:
+                metadata = {
+                    "name": part,
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "parents": [parent_id],
+                }
+                created = (
+                    self.service.files()
+                    .create(
+                        body=metadata,
+                        fields="id",
+                        supportsAllDrives=True,
+                    )
+                    .execute()
+                )
+                parent_id = created["id"]
+            self._id_cache[current_path] = parent_id
+
+    def leave(self) -> None:
+        self.service = None
+        self._id_cache.clear()
 
 
 def _parse_ls_line(line: str) -> VFile | None:
@@ -1574,6 +1956,8 @@ class App:
             CompressedFS(),
             S3FS(),
             GCSFS(),
+            OCIFS(),
+            GDriveFS(),
             SSHFS(),
         ]
 
