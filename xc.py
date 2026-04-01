@@ -40,7 +40,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-VERSION = "0.2.11"
+VERSION = "0.2.12"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -390,7 +390,7 @@ class TarFS(VFS):
 
     def enter(self, header: bytes, filename: str, cwd: str = "") -> VFS:
         lower = filename.lower()
-        mode = "r:"
+        mode = "r:*"
         if lower.endswith(".gz") or lower.endswith(".tgz"):
             mode = "r:gz"
         elif lower.endswith(".bz2") or lower.endswith(".tbz2"):
