@@ -40,7 +40,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-VERSION = "0.2.12"
+VERSION = "0.2.13"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -372,6 +372,8 @@ class TarFS(VFS):
         self.dirs: dict[str, list[VFile]] | None = None
         self.archive_path: str = ""
         self.tar_mode: str = "r:"
+        self.tf: tarfile.TarFile | None = None
+        self._members: dict[str, tarfile.TarInfo] = {}
 
     def probe(self, header: bytes, filename: str) -> bool:
         lower = filename.lower()
@@ -400,6 +402,7 @@ class TarFS(VFS):
         tf = tarfile.open(filename, mode)
         dirs: dict[str, list[VFile]] = {}
         seen: set[str] = set()
+        members: dict[str, tarfile.TarInfo] = {}
 
         def ensure_dir_chain(dir_path: str) -> None:
             if not dir_path:
@@ -436,6 +439,8 @@ class TarFS(VFS):
             if key in seen:
                 continue
             seen.add(key)
+            if not member.isdir():
+                members[name] = member
             ensure_dir_chain(d)
             dirs.setdefault(d, []).append(
                 VFile(
@@ -446,13 +451,14 @@ class TarFS(VFS):
                 )
             )
 
-        tf.close()
         for d in dirs:
             dirs[d] = sort_files(dirs[d])
         new_fs = TarFS()
         new_fs.dirs = dirs
         new_fs.archive_path = filename
         new_fs.tar_mode = mode
+        new_fs.tf = tf
+        new_fs._members = members
         return new_fs
 
     def read_dir(self, path: str) -> list[VFile]:
@@ -463,6 +469,13 @@ class TarFS(VFS):
         return self.dirs[path]
 
     def read_file(self, path: str) -> io.IOBase:
+        if self.tf is not None and path in self._members:
+            f = self.tf.extractfile(self._members[path])
+            if f is None:
+                raise OSError(f"cannot read {path} from tar archive")
+            data = f.read()
+            f.close()
+            return io.BytesIO(data)
         tf = tarfile.open(self.archive_path, self.tar_mode)
         member = tf.getmember(path)
         f = tf.extractfile(member)
@@ -474,6 +487,24 @@ class TarFS(VFS):
         tf.close()
         return io.BytesIO(data)
 
+    def read_files(self, paths: set[str]) -> dict[str, io.BytesIO]:
+        """Extract multiple files in one sequential pass (no repeated decompression)."""
+        result: dict[str, io.BytesIO] = {}
+        remaining = set(paths)
+        stream_mode = self.tar_mode.replace("r:", "r|")
+        with tarfile.open(self.archive_path, stream_mode) as tf:
+            for member in tf:
+                if not remaining:
+                    break
+                name = os.path.normpath(member.name)
+                if name in remaining:
+                    f = tf.extractfile(member)
+                    if f is not None:
+                        result[name] = io.BytesIO(f.read())
+                        f.close()
+                    remaining.discard(name)
+        return result
+
     def write_file(self, path: str, data: io.IOBase) -> None:
         raise OSError("writing to tar archives not supported")
 
@@ -481,6 +512,10 @@ class TarFS(VFS):
         raise OSError("creating directories in tar archives not supported")
 
     def leave(self) -> None:
+        if self.tf is not None:
+            self.tf.close()
+            self.tf = None
+        self._members = {}
         self.dirs = None
         self.archive_path = ""
 
@@ -1922,6 +1957,7 @@ class App:
         self.search_query: list[str] = []
         self.grep_mode = 0  # 0=off, 1=file pattern, 2=search string
         self.grep_sensitive = True
+        self.grep_with_grep = False
         self.grep_edit: list[str] = []
         self.grep_cursor = 0
         self.grep_file_pattern = ""
@@ -2127,15 +2163,16 @@ class App:
 
     # -- Grep --
 
-    def start_grep(self, sensitive: bool) -> None:
+    def start_grep(self, with_grep: bool) -> None:
         p = self.panels[self.active]
         if not isinstance(p.fs, LocalFS):
-            self.set_error("grep works only on local filesystem")
+            self.set_error("search works only on local filesystem")
             return
-        self.grep_sensitive = sensitive
+        self.grep_sensitive = True
+        self.grep_with_grep = with_grep
         self.grep_mode = 1
-        self.grep_edit = []
-        self.grep_cursor = 0
+        self.grep_edit = list("*.*")
+        self.grep_cursor = len(self.grep_edit)
         self.grep_file_pattern = ""
 
     def spinner_check_esc(self, frame: int) -> bool:
@@ -2332,6 +2369,95 @@ class App:
                 self._copy_dir(src_fs, child_src, dst_fs, child_dst)
             else:
                 self._copy_file(src_fs, child_src, dst_fs, child_dst)
+
+    def _copy_tagged(self, names: list[str], dest: str) -> None:
+        src_panel = self.panels[self.active]
+        dst_panel = self.panels[1 - self.active]
+        src_fs = src_panel.fs
+        # Batch optimisation for TarFS: single-pass extraction avoids
+        # decompressing a large .tar.gz once per file.
+        if isinstance(src_fs, TarFS) and len(names) > 1:
+            file_lookup = {f.name: f for f in src_panel.files}
+            file_names: list[str] = []
+            dir_names: list[str] = []
+            for name in names:
+                fi = file_lookup.get(name)
+                if fi and fi.is_dir():
+                    dir_names.append(name)
+                else:
+                    file_names.append(name)
+            # Collect all tar paths for flat files and dir descendants.
+            tar_to_dest: list[tuple[str, str]] = []
+            dirs_to_create: list[str] = []
+            for name in file_names:
+                tp = vfs_join(src_fs, src_panel.path, name)
+                d = dest
+                if d.endswith("/"):
+                    d += name
+                elif isinstance(dst_panel.fs, LocalFS) and os.path.isdir(d):
+                    d = os.path.join(d, name)
+                tar_to_dest.append((tp, d))
+            for name in dir_names:
+                tp = vfs_join(src_fs, src_panel.path, name)
+                d = dest
+                if d.endswith("/"):
+                    d += name
+                elif isinstance(dst_panel.fs, LocalFS) and os.path.isdir(d):
+                    d = os.path.join(d, name)
+                self._collect_tar_tree(
+                    src_fs, tp, d, dst_panel.fs, tar_to_dest, dirs_to_create
+                )
+            for dp in dirs_to_create:
+                try:
+                    dst_panel.fs.mkdir_all(dp)
+                except Exception as e:
+                    self.set_error(str(e))
+            tar_paths = {tp for tp, _ in tar_to_dest}
+            extracted = src_fs.read_files(tar_paths)
+            for tp, dp in tar_to_dest:
+                if tp in extracted:
+                    log.info("copy file from=%s to=%s", tp, dp)
+                    try:
+                        dst_panel.fs.write_file(dp, extracted[tp])
+                    except Exception as e:
+                        self.set_error(str(e))
+                    dst_panel.reload()
+                    self.draw()
+                    self.scr.refresh()
+            self.panels[0].reload()
+            self.panels[1].reload()
+        else:
+            for name in names:
+                self.do_copy(name, dest)
+
+    def _collect_tar_tree(
+        self,
+        src_fs: TarFS,
+        src_path: str,
+        dst_path: str,
+        dst_fs: VFS,
+        tar_to_dest: list[tuple[str, str]],
+        dirs_to_create: list[str],
+    ) -> None:
+        dirs_to_create.append(dst_path)
+        try:
+            files = src_fs.read_dir(src_path)
+        except OSError:
+            return
+        for f in files:
+            child_src = src_path + "/" + f.name
+            child_dst = vfs_join(dst_fs, dst_path, f.name)
+            if f.is_dir():
+                self._collect_tar_tree(
+                    src_fs,
+                    child_src,
+                    child_dst,
+                    dst_fs,
+                    tar_to_dest,
+                    dirs_to_create,
+                )
+            else:
+                tar_to_dest.append((child_src, child_dst))
 
     def do_delete(self, name: str) -> None:
         p = self.panels[self.active]
@@ -3030,12 +3156,11 @@ class App:
             return
 
         if self.grep_mode > 0:
-            verb = "grep" if self.grep_sensitive else "(i)grep"
             if self.grep_mode == 1:
-                prompt = "find in "
+                prompt = "search "
             else:
                 pat = self.grep_file_pattern or "*"
-                prompt = f"find in {pat} {verb} for "
+                prompt = f"search {pat} grep for "
             pw = len(prompt)
             self.draw_string(x, y, prompt, pw, attr)
             edit_w = w - pw
@@ -3168,7 +3293,7 @@ class App:
             "Commands",
             "  ;             command line (shell)",
             "  :             command line (internal)",
-            "  s/S           grep (recursive / current dir)",
+            "  s/S           search / search with grep",
             "  /             search in file list",
             "  i             calculate directory sizes",
             "",
@@ -3301,8 +3426,7 @@ class App:
                 p = self.panels[self.active]
                 if p.tagged:
                     names = [f.name for f in p.files if p.tagged.get(f.name)]
-                    for name in names:
-                        self.do_copy(name, dest)
+                    self._copy_tagged(names, dest)
                     if is_move:
                         for name in names:
                             self.do_delete(name)
@@ -3379,7 +3503,10 @@ class App:
                 self.grep_file_pattern = "".join(self.grep_edit).strip()
                 self.grep_edit = []
                 self.grep_cursor = 0
-                self.grep_mode = 2
+                if self.grep_with_grep:
+                    self.grep_mode = 2
+                else:
+                    self.exec_grep()
             else:
                 self.exec_grep()
             return
@@ -3851,8 +3978,8 @@ def main(stdscr: curses.window) -> None:
     app.add_keymap(";", lambda: setattr(app, "cmd_mode", 1))
     app.add_keymap(":", lambda: setattr(app, "cmd_mode", 2))
     app.add_keymap("r", lambda: app.action_remotes())
-    app.add_keymap("s", lambda: app.start_grep(True))
-    app.add_keymap("S", lambda: app.start_grep(False))
+    app.add_keymap("s", lambda: app.start_grep(False))
+    app.add_keymap("S", lambda: app.start_grep(True))
 
     app.run()
 
