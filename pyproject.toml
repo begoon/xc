@@ -1,12 +1,26 @@
-[project]                                                                                                             
-name = "xc"
-version = "0.0.0"
+[project]
+name = "xcfm"
+version = "0.1.2"
+description = "Two-panel console file manager"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.11"
 dependencies = [
-    "boto3>=1.42.68",
-    "google-cloud-storage>=3.9.0",
+    "boto3",
+    "google-cloud-storage",
+    "oci",
+    "google-api-python-client",
+    "google-auth",
 ]
+
+[project.scripts]
+xcfm = "xc:entry"
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["xc"]
 
 [tool.black]
 line-length = 80

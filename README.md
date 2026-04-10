@@ -29,6 +29,12 @@ powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | ie
 After installing, run the file manager with:
 
 ```sh
+uvx xcfm
+```
+
+Or directly from a cloned repo:
+
+```sh
 uv run xc.py
 ```
 

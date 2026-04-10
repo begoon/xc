@@ -9,4 +9,7 @@ xc
 remotes/keys/*.*
 
 __pycache__
+*.egg-info/
+dist/
+build/
 *.key

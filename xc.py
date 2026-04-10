@@ -4022,7 +4022,7 @@ def self_update() -> None:
     print(f"updated {lv} -> {rv}, previous version saved to {prev}")
 
 
-if __name__ == "__main__":
+def entry():
     if len(sys.argv) > 1 and sys.argv[1] == "-u":
         self_update()
         sys.exit(0)
@@ -4030,7 +4030,9 @@ if __name__ == "__main__":
     log.info("starting xc.py")
     try:
         curses.wrapper(main)
-    except SystemExit:
+    except (SystemExit, KeyboardInterrupt):
         pass
-    except KeyboardInterrupt:
-        pass
+
+
+if __name__ == "__main__":
+    entry()
