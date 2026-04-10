@@ -2,13 +2,13 @@
 
 A two-panel console file manager inspired by Midnight Commander, written in Python.
 
-![xc](xc.png)
+![xc](https://raw.githubusercontent.com/begoon/xc/main/xc.png)
 
 ## Intro
 
 The Python version of xc is a single self-contained script (`xc.py`) that runs via [uv](https://docs.astral.sh/uv/). This means:
 
-- **Zero setup** -- no virtualenv, no `pip install`, no `requirements.txt`. Just run `uv run xc.py`.
+- **Zero setup** -- no virtualenv, no `pip install`, no `requirements.txt`. Just run `uvx xcfm`.
 - **Inline dependencies** -- the script header declares its own dependencies (`boto3`, `google-cloud-storage`, `oci`, `google-api-python-client`), and uv resolves and caches them automatically on the first run.
 - **Reproducible** -- uv pins the Python version (`>=3.11`) and handles isolation, so the script works the same way on any machine.
 - **Single file to deploy** -- copy `xc.py` to a server, a dotfiles repo, or a USB stick. There is nothing else to carry.
@@ -156,11 +156,11 @@ xc runs on the terminal's **alternate screen** -- the panels never mix with your
 
 To review previous command output without running anything:
 
-| Key              | Action                          |
-| ---------------- | ------------------------------- |
-| `Esc` `Esc`      | Switch to main screen           |
-| `Ctrl-O`         | Switch to main screen           |
-| `Esc` or `Ctrl-O` | Return to panels (main screen) |
+| Key                | Action                          |
+| ------------------ | ------------------------------- |
+| `Esc` `Esc`        | Switch to main screen           |
+| `Ctrl-O`           | Switch to main screen           |
+| `Esc` or `Ctrl-O`  | Return to panels (main screen)  |
 
 Once on the main screen you can scroll through your terminal's history as usual. Press `Esc` or `Ctrl-O` to return to the file panels.
 
@@ -168,12 +168,14 @@ Once on the main screen you can scroll through your terminal's history as usual.
 
 Press `/` to start an incremental search. Type characters to filter -- the cursor jumps to the first matching file. Press `Enter` to accept or `Esc` to cancel.
 
-### Grep (`s` / `S`)
+### Search (`s` / `S`)
 
-Press `s` for case-sensitive search or `S` for case-insensitive search. This is a two-step prompt:
+Press `s` to search by file name pattern, or `S` to search file contents (grep).
 
-1. **File pattern** -- `grep in ` (or `igrep in `) appears. Enter a glob pattern to filter by filename. Leave empty to search all files.
-2. **Search string** -- `grep in *.py for ` appears. Enter the text to find. Leave empty to list files matching the pattern only.
+- `s` -- **File search**. A `search` prompt appears. Enter a glob pattern (e.g. `*.py`) to find matching files recursively.
+- `S` -- **Grep search**. A two-step prompt:
+  1. **File pattern** -- `search` prompt appears. Enter a glob pattern to filter by filename (default `*.*`).
+  2. **Search string** -- `search *.py grep for` prompt appears. Enter the text to find in file contents.
 
 The file pattern uses Unix shell-style wildcards (matched against the filename only, not the path):
 
@@ -182,7 +184,7 @@ The file pattern uses Unix shell-style wildcards (matched against the filename o
 | `*`       | Matches everything                               | `*.py` -- all Python |
 | `?`       | Matches any single character                     | `?.txt` -- `a.txt`   |
 | `[seq]`   | Matches any character in *seq*                   | `[abc].py`           |
-| `[!seq]`  | Matches any character **not** in *seq*            | `[!.]cfg`            |
+| `[!seq]`  | Matches any character **not** in *seq*           | `[!.]cfg`            |
 
 Patterns do **not** support `**` (recursive globs) or path separators -- they match the base filename only.
 
@@ -190,7 +192,7 @@ Search is implemented in pure Python -- no external tools required. Binary files
 
 Results are displayed as a virtual filesystem tree (GREP) on the current panel. Navigate the results normally -- directories expand, `..` exits back to the real filesystem.
 
-Grep works only on local filesystems.
+Search works only on local filesystems.
 
 ### Command history (`Esc` `h`)
 
@@ -213,16 +215,16 @@ There is no config file on purpose. The script **is** the config.
 
 Entering certain files opens them as virtual directories:
 
-| Extension                                    | VFS    | Description                         |
-| -------------------------------------------- | ------ | ----------------------------------- |
-| `.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`        | TAR    | Browse tar archives                 |
-| `.zip`                                       | ZIP    | Browse zip archives                 |
-| `.gz`, `.bz2`, `.xz`, `.lzma`               | -      | View compressed single files        |
-| `.s3`                                        | S3     | Browse Amazon S3 buckets            |
-| `.gcs`                                       | GCS    | Browse Google Cloud Storage buckets |
-| `.oci`                                       | OCI    | Browse Oracle Cloud Object Storage  |
-| `.gdrive`                                    | GDrive | Browse Google Drive folders         |
-| `.ssh`                                       | SSH    | Browse remote servers over SSH      |
+| Extension                                     | VFS    | Description                         |
+| ----------------------------------------------- | ------ | ----------------------------------- |
+| `.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`          | TAR    | Browse tar archives                 |
+| `.zip`                                          | ZIP    | Browse zip archives                 |
+| `.gz`, `.bz2`, `.xz`, `.lzma`                  | \-     | View compressed single files        |
+| `.s3`                                           | S3     | Browse Amazon S3 buckets            |
+| `.gcs`                                          | GCS    | Browse Google Cloud Storage buckets |
+| `.oci`                                          | OCI    | Browse Oracle Cloud Object Storage  |
+| `.gdrive`                                       | GDrive | Browse Google Drive folders         |
+| `.ssh`                                          | SSH    | Browse remote servers over SSH      |
 
 VFS config files (`.s3`, `.gcs`, `.oci`, `.gdrive`, `.ssh`) are simple `key=value` text files. The path header shows the VFS type, e.g. `~/servers/prod.ssh (SSH)`.
 

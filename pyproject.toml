@@ -1,6 +1,6 @@
 [project]
 name = "xcfm"
-version = "0.1.2"
+dynamic = ["version"]
 description = "Two-panel console file manager"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -21,6 +21,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 py-modules = ["xc"]
+
+[tool.setuptools.dynamic]
+version = {attr = "xc.VERSION"}
 
 [tool.black]
 line-length = 80
