@@ -32,6 +32,14 @@ After installing, run the file manager with:
 uvx xcfm
 ```
 
+Or download the script directly:
+
+```sh
+curl -LO https://raw.githubusercontent.com/begoon/xc/main/xc.py
+chmod +x xc.py
+uv run xc.py
+```
+
 Or directly from a cloned repo:
 
 ```sh
