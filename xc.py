@@ -40,7 +40,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-VERSION = "0.2.18"
+VERSION = "0.2.19"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -1913,6 +1913,7 @@ CP_EXT_PY = 16
 CP_EXT_JSON = 17
 CP_EXT_REMOTE = 18
 CP_EXT_ARCHIVE = 19
+CP_EXT_ENV = 20
 
 EXT_COLORS: dict[str, int] = {
     ".jpg": CP_EXT_IMAGE,
@@ -1940,9 +1941,16 @@ EXT_COLORS: dict[str, int] = {
     ".bz2": CP_EXT_ARCHIVE,
     ".xz": CP_EXT_ARCHIVE,
     ".lzma": CP_EXT_ARCHIVE,
+    ".mk": CP_EXT_GO,
+    ".just": CP_EXT_GO,
 }
 
-DIMMED_NAMES = {"node_modules", "__pycache__"}
+NAME_COLORS: dict[str, int] = {
+    "Makefile": CP_EXT_GO,
+    "Justfile": CP_EXT_GO,
+}
+
+DIMMED_NAMES = {"node_modules", "__pycache__", "dist"}
 
 
 def is_dimmed(name: str) -> bool:
@@ -1973,6 +1981,7 @@ def init_colors() -> None:
     curses.init_pair(CP_EXT_JSON, curses.COLOR_RED, curses.COLOR_BLUE)
     curses.init_pair(CP_EXT_REMOTE, curses.COLOR_WHITE, curses.COLOR_BLUE)
     curses.init_pair(CP_EXT_ARCHIVE, curses.COLOR_RED, curses.COLOR_BLUE)
+    curses.init_pair(CP_EXT_ENV, curses.COLOR_YELLOW, curses.COLOR_BLUE)
 
 
 # ---------------------------------------------------------------------------
@@ -3100,9 +3109,11 @@ class App:
                     style = attr_dir
                 else:
                     ext = os.path.splitext(f.name)[1].lower()
-                    ext_cp = EXT_COLORS.get(ext)
+                    ext_cp = NAME_COLORS.get(f.name) or EXT_COLORS.get(ext)
                     if ext_cp:
                         style = curses.color_pair(ext_cp)
+                    elif f.name.lower().startswith(".env"):
+                        style = curses.color_pair(CP_EXT_ENV)
                     else:
                         style = attr_def
                 self.draw_string(x + 1, row_y, line, inner_w, style)
