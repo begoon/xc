@@ -32,7 +32,7 @@ After installing, run the file manager with:
 uvx xcfm
 ```
 
-Or install and run in one go:
+Or download the script and make it executable as "xc":
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/begoon/xc/main/install.sh | sh
