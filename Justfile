@@ -72,3 +72,27 @@ push:
 
     import subprocess
     subprocess.run(["git", "push"], check=True)
+
+publish token:
+    #!/usr/bin/env python3
+    import sys, json, urllib.request
+    sys.path.insert(0, ".")
+    from xc import VERSION, _parse_version
+
+    local = _parse_version(f'VERSION = "{VERSION}"')
+    url = "https://pypi.org/pypi/xcfm/json"
+    with urllib.request.urlopen(url) as r:
+        pypi_version = json.loads(r.read())["info"]["version"]
+    remote = _parse_version(f'VERSION = "{pypi_version}"')
+
+    lv = ".".join(str(x) for x in local)
+    rv = ".".join(str(x) for x in remote)
+    print(f"local {lv}, pypi {rv}")
+    if local <= remote:
+        sys.exit(f"local version {lv} must be higher than pypi {rv}")
+
+    import subprocess, shutil
+    shutil.rmtree("dist", ignore_errors=True)
+    subprocess.run(["uv", "build"], check=True)
+    subprocess.run(["uv", "publish", "--token", "{{ token }}"], check=True)
+    print(f"published {lv}")

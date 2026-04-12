@@ -40,7 +40,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-VERSION = "0.2.15"
+VERSION = "0.2.18"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -1905,6 +1905,42 @@ CP_MENU = 8
 CP_MENUSEL = 9
 CP_DIR = 10
 CP_DIM = 11
+CP_EXT_IMAGE = 12
+CP_EXT_JS = 13
+CP_EXT_MD = 14
+CP_EXT_GO = 15
+CP_EXT_PY = 16
+CP_EXT_JSON = 17
+CP_EXT_REMOTE = 18
+CP_EXT_ARCHIVE = 19
+
+EXT_COLORS: dict[str, int] = {
+    ".jpg": CP_EXT_IMAGE,
+    ".jpeg": CP_EXT_IMAGE,
+    ".png": CP_EXT_IMAGE,
+    ".ico": CP_EXT_IMAGE,
+    ".bmp": CP_EXT_IMAGE,
+    ".ts": CP_EXT_JS,
+    ".js": CP_EXT_JS,
+    ".md": CP_EXT_MD,
+    ".go": CP_EXT_GO,
+    ".py": CP_EXT_PY,
+    ".json": CP_EXT_JSON,
+    ".s3": CP_EXT_REMOTE,
+    ".gcs": CP_EXT_REMOTE,
+    ".gdrive": CP_EXT_REMOTE,
+    ".oci": CP_EXT_REMOTE,
+    ".ssh": CP_EXT_REMOTE,
+    ".tar": CP_EXT_ARCHIVE,
+    ".tgz": CP_EXT_ARCHIVE,
+    ".tbz2": CP_EXT_ARCHIVE,
+    ".txz": CP_EXT_ARCHIVE,
+    ".zip": CP_EXT_ARCHIVE,
+    ".gz": CP_EXT_ARCHIVE,
+    ".bz2": CP_EXT_ARCHIVE,
+    ".xz": CP_EXT_ARCHIVE,
+    ".lzma": CP_EXT_ARCHIVE,
+}
 
 DIMMED_NAMES = {"node_modules", "__pycache__"}
 
@@ -1916,17 +1952,27 @@ def is_dimmed(name: str) -> bool:
 def init_colors() -> None:
     curses.start_color()
     curses.use_default_colors()
-    curses.init_pair(CP_DEF, curses.COLOR_WHITE, curses.COLOR_BLACK)
+    if curses.can_change_color():
+        curses.init_color(curses.COLOR_BLUE, 0, 0, 500)
+    curses.init_pair(CP_DEF, curses.COLOR_CYAN, curses.COLOR_BLUE)
     curses.init_pair(CP_CURSOR, curses.COLOR_BLACK, curses.COLOR_CYAN)
-    curses.init_pair(CP_TAGGED, curses.COLOR_YELLOW, curses.COLOR_BLACK)
-    curses.init_pair(CP_BORDER, curses.COLOR_WHITE, curses.COLOR_BLACK)
+    curses.init_pair(CP_TAGGED, curses.COLOR_YELLOW, curses.COLOR_BLUE)
+    curses.init_pair(CP_BORDER, curses.COLOR_CYAN, curses.COLOR_BLUE)
     curses.init_pair(CP_STATUS, curses.COLOR_BLACK, curses.COLOR_CYAN)
     curses.init_pair(CP_CMDLINE, curses.COLOR_WHITE, curses.COLOR_BLACK)
-    curses.init_pair(CP_ERR, curses.COLOR_RED, curses.COLOR_BLACK)
+    curses.init_pair(CP_ERR, curses.COLOR_YELLOW, curses.COLOR_RED)
     curses.init_pair(CP_MENU, curses.COLOR_WHITE, curses.COLOR_BLACK)
     curses.init_pair(CP_MENUSEL, curses.COLOR_BLACK, curses.COLOR_CYAN)
-    curses.init_pair(CP_DIR, curses.COLOR_WHITE, curses.COLOR_BLACK)
-    curses.init_pair(CP_DIM, curses.COLOR_WHITE, curses.COLOR_BLACK)
+    curses.init_pair(CP_DIR, curses.COLOR_WHITE, curses.COLOR_BLUE)
+    curses.init_pair(CP_DIM, curses.COLOR_CYAN, curses.COLOR_BLUE)
+    curses.init_pair(CP_EXT_IMAGE, curses.COLOR_MAGENTA, curses.COLOR_BLUE)
+    curses.init_pair(CP_EXT_JS, curses.COLOR_YELLOW, curses.COLOR_BLUE)
+    curses.init_pair(CP_EXT_MD, curses.COLOR_WHITE, curses.COLOR_BLUE)
+    curses.init_pair(CP_EXT_GO, curses.COLOR_GREEN, curses.COLOR_BLUE)
+    curses.init_pair(CP_EXT_PY, curses.COLOR_GREEN, curses.COLOR_BLUE)
+    curses.init_pair(CP_EXT_JSON, curses.COLOR_RED, curses.COLOR_BLUE)
+    curses.init_pair(CP_EXT_REMOTE, curses.COLOR_WHITE, curses.COLOR_BLUE)
+    curses.init_pair(CP_EXT_ARCHIVE, curses.COLOR_RED, curses.COLOR_BLUE)
 
 
 # ---------------------------------------------------------------------------
@@ -3001,24 +3047,31 @@ class App:
         attr_tagged = curses.color_pair(CP_TAGGED)
         attr_dim = curses.color_pair(CP_DIM) | curses.A_DIM
 
+        if active:
+            attr_border |= curses.A_BOLD
+        ul, ur = curses.ACS_ULCORNER, curses.ACS_URCORNER
+        ll, lr = curses.ACS_LLCORNER, curses.ACS_LRCORNER
+        hline, vline = curses.ACS_HLINE, curses.ACS_VLINE
+
         # Top border with path
-        self.set_cell(x, y, curses.ACS_ULCORNER, attr_border)
-        self.set_cell(x + w - 1, y, curses.ACS_URCORNER, attr_border)
+        self.set_cell(x, y, ul, attr_border)
+        self.set_cell(x + w - 1, y, ur, attr_border)
         display_path = shorten_home(p.display_path())
         title = " " + display_path + " "
+        attr_title = attr_cursor if active else attr_border
         for i in range(1, w - 1):
             idx = i - 1
             if idx < len(title):
-                self.set_cell(x + i, y, title[idx], attr_border)
+                self.set_cell(x + i, y, title[idx], attr_title)
             else:
-                self.set_cell(x + i, y, curses.ACS_HLINE, attr_border)
+                self.set_cell(x + i, y, hline, attr_border)
 
         # File rows
         for row in range(visible_rows):
             file_idx = p.offset + row
             row_y = y + 1 + row
-            self.set_cell(x, row_y, curses.ACS_VLINE, attr_border)
-            self.set_cell(x + w - 1, row_y, curses.ACS_VLINE, attr_border)
+            self.set_cell(x, row_y, vline, attr_border)
+            self.set_cell(x + w - 1, row_y, vline, attr_border)
 
             if file_idx < len(p.files):
                 f = p.files[file_idx]
@@ -3046,7 +3099,12 @@ class App:
                 elif f.is_dir():
                     style = attr_dir
                 else:
-                    style = attr_def
+                    ext = os.path.splitext(f.name)[1].lower()
+                    ext_cp = EXT_COLORS.get(ext)
+                    if ext_cp:
+                        style = curses.color_pair(ext_cp)
+                    else:
+                        style = attr_def
                 self.draw_string(x + 1, row_y, line, inner_w, style)
             else:
                 self.draw_string(x + 1, row_y, "", inner_w, attr_def)
@@ -3056,17 +3114,27 @@ class App:
         counter = f"[{p.cursor}/{len(p.files)}]"
         suffix = ""
         if p.tagged:
-            total = 0
+            tag_total = 0
             for f in p.files:
                 if not p.tagged.get(f.name):
                     continue
                 if f.is_dir():
                     ds = p.dir_sizes.get(f.name)
                     if ds is not None:
-                        total += ds
+                        tag_total += ds
                 else:
-                    total += f.size
-            suffix = f" selected {format_size(total)} "
+                    tag_total += f.size
+            suffix = f" selected {format_size(tag_total)} "
+        elif active:
+            try:
+                st = os.statvfs(p.path)
+                disk_total = st.f_blocks * st.f_frsize
+                disk_free = st.f_bavail * st.f_frsize
+                if disk_total > 0:
+                    free_pct = disk_free / disk_total * 100
+                    suffix = f" {format_size(disk_free)} / {format_size(disk_total)} ({free_pct:.0f}%) "
+            except OSError:
+                pass
 
         suffix_start = w - 1 - len(suffix)
         for i in range(w):
@@ -3080,9 +3148,9 @@ class App:
                     attr_border,
                 )
             elif i == w - 1:
-                self.set_cell(x + i, bottom_y, curses.ACS_LRCORNER, attr_border)
+                self.set_cell(x + i, bottom_y, lr, attr_border)
             else:
-                self.set_cell(x + i, bottom_y, curses.ACS_HLINE, attr_border)
+                self.set_cell(x + i, bottom_y, hline, attr_border)
 
     def draw_status_line(self, x: int, y: int, w: int) -> None:
         attr = curses.color_pair(CP_STATUS)
@@ -3095,14 +3163,6 @@ class App:
         dp = p.disk_path(f.name)
         if dp:
             try:
-                st = os.statvfs(p.path)
-                total = st.f_blocks * st.f_frsize
-                free = st.f_bavail * st.f_frsize
-                used_pct = (total - free) / total * 100 if total > 0 else 0
-                parts.append(f"{format_size(free)} free {used_pct:.1f}% used")
-            except OSError:
-                pass
-            try:
                 info = os.lstat(dp)
                 mode = stat.filemode(info.st_mode)
                 nlinks = info.st_nlink
@@ -3110,8 +3170,7 @@ class App:
                     "%Y-%m-%d %H:%M:%S"
                 )
                 prefix = f"{mode} {nlinks} {info.st_size} {dt} "
-                prior = " ".join(parts) + " " if parts else ""
-                avail = w - len(prior) - len(prefix)
+                avail = w - len(prefix)
                 name = shorten_name(f.name, max(avail, 1))
                 parts.append(prefix + name)
             except OSError:
@@ -3124,8 +3183,7 @@ class App:
                 else ""
             )
             prefix = f"{type_str} {format_size(f.size)} {dt} "
-            prior = " ".join(parts) + " " if parts else ""
-            avail = w - len(prior) - len(prefix)
+            avail = w - len(prefix)
             name = shorten_name(f.name, max(avail, 1))
             parts.append(prefix + name)
         self.draw_string(x, y, " ".join(parts), w, attr)
@@ -3198,7 +3256,10 @@ class App:
         self.cursor_pos = (y, x + pw + self.cmd_cursor - view_offset)
 
     def draw_err_line(self, x: int, y: int, w: int) -> None:
-        attr = curses.color_pair(CP_ERR) | curses.A_BOLD
+        if self.err_msg:
+            attr = curses.color_pair(CP_ERR) | curses.A_BOLD
+        else:
+            attr = curses.color_pair(CP_CMDLINE)
         self.draw_string(x, y, self.err_msg, w, attr)
 
     def draw_menu(self) -> None:
@@ -3311,7 +3372,7 @@ class App:
         y0 = (h - box_h) // 2
         attr = curses.color_pair(CP_MENU)
         attr_title = curses.color_pair(CP_MENU) | curses.A_BOLD
-        attr_border = curses.color_pair(CP_BORDER)
+        attr_border = curses.color_pair(CP_MENU)
         # fill background
         for dy in range(box_h):
             self.draw_string(x0, y0 + dy, "", box_w, attr)
