@@ -40,7 +40,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-VERSION = "0.2.19"
+VERSION = "0.2.20"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -3623,9 +3623,12 @@ class App:
             p = self.panels[self.active]
             f = p.selected_file()
             if f and f.name != "..":
-                self.cmd_mode = 1
-                self.cmd_line = list(quote_if_needed(f.name))
-                self.cmd_cursor = len(self.cmd_line)
+                if f.is_dir():
+                    p.enter()
+                else:
+                    self.cmd_mode = 1
+                    self.cmd_line = list(quote_if_needed(f.name))
+                    self.cmd_cursor = len(self.cmd_line)
         elif key in (curses.KEY_BACKSPACE, 127, 8):
             if self.search_query:
                 self.search_query.pop()
