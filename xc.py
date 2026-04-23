@@ -40,7 +40,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-VERSION = "0.2.20"
+VERSION = "0.2.21"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -3357,8 +3357,7 @@ class App:
             "",
             "Menus",
             "  x             command menu",
-            "  e             editor menu",
-            "  v             view menu",
+            "  e             edit/view menu",
             "  b             bookmark menu",
             "  r             remotes",
             "",
@@ -4023,11 +4022,14 @@ def main(stdscr: curses.window) -> None:
     )
 
     app.add_menu(
-        "editor",
+        "edit/view",
         [
-            MenuItem("v", "vi", lambda: app.action_run("vi %F")),
+            MenuItem("e", "vi", lambda: app.action_run("vi %F")),
             MenuItem("m", "mcedit", lambda: app.action_run("mcedit %F")),
-            MenuItem("x", "view...", lambda: app.menu("view")),
+            MenuItem("v", "mcview", lambda: app.action_run("mcview %F")),
+            MenuItem("l", "less", lambda: app.action_run("less %F")),
+            MenuItem("j", "jq", lambda: app.action_run("cat %F | jq .")),
+            MenuItem("x", "xxd", lambda: app.action_run("xxd -g 1 %F")),
         ]
         + (
             [MenuItem("c", "cot", lambda: app.action_run("cot %F"))]
@@ -4036,20 +4038,10 @@ def main(stdscr: curses.window) -> None:
         ),
     )
 
-    app.add_menu(
-        "view",
-        [
-            MenuItem("l", "less", lambda: app.action_run("less %F")),
-            MenuItem("j", "jq", lambda: app.action_run("cat %F | jq .")),
-            MenuItem("v", "xxd", lambda: app.action_run("xxd -g 1 %F")),
-        ],
-    )
-
     # Register keymaps
     app.add_keymap("x", lambda: app.menu_selector("command"))
     app.add_keymap("b", lambda: app.menu_selector("bookmark"))
-    app.add_keymap("e", lambda: app.menu_selector("editor"))
-    app.add_keymap("v", lambda: app.menu_selector("view"))
+    app.add_keymap("e", lambda: app.menu_selector("edit/view"))
     app.add_keymap(";", lambda: setattr(app, "cmd_mode", 1))
     app.add_keymap(":", lambda: setattr(app, "cmd_mode", 2))
     app.add_keymap("r", lambda: app.action_remotes())
