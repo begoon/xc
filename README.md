@@ -208,6 +208,29 @@ Results are displayed as a virtual filesystem tree (GREP) on the current panel. 
 
 Search works only on local filesystems.
 
+### Processes (`p`)
+
+Press `p` to open a modal showing all running processes with PID, user, full command line (middle-truncated with `...` to fit), and any listening TCP/UDP ports.
+
+The layout is:
+
+- **Filter input** at the top — space-separated words. All words must appear in the command line, ports, pid, or user. A word prefixed with `-` excludes matches containing that word.
+- **Process list** with the filtered results.
+- **Full command line** of the selected process, below the list.
+- **Environment variables** of the selected process at the bottom (read from `/proc/<pid>/environ` on Linux, or `ps eww` on macOS).
+
+| Key                              | Action                                              |
+| -------------------------------- | --------------------------------------------------- |
+| `Tab`                            | Cycle focus: filter → list → env                    |
+| `Up` / `Down` / `PgUp` / `PgDn`  | Navigate list (scrolls env when env is focused)     |
+| `Home` / `End`                   | Jump to first / last entry                          |
+| letters / `Backspace`            | Edit the filter                                     |
+| `k` (list focus) / `Ctrl-K`      | Send `SIGKILL` (`kill -9`) with `y/N` confirmation  |
+| `Ctrl-R`                         | Refresh the process list                            |
+| `Esc`                            | Close the modal                                     |
+
+Listening ports are gathered via `lsof -iTCP -sTCP:LISTEN -iUDP`. On machines where `lsof` is restricted or not installed, the ports column will simply be empty.
+
 ### Command history (`Esc` `h`)
 
 In command-line mode (`;` or `:`), press `Esc` then `h` to open a history selector showing previously executed commands. Use `Up` / `Down` to browse, `Enter` to accept, `Esc` to cancel. History is persisted across sessions (up to 100 entries).

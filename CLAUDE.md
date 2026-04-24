@@ -68,6 +68,17 @@ Detection is probe-based: iterate `probes` list, first match wins. Add new VFS t
 - Color constants: `CP_DEF`, `CP_CURSOR`, `CP_TAGGED`, `CP_BORDER`, `CP_STATUS`, `CP_CMDLINE`, `CP_ERR`, `CP_MENU`, `CP_MENUSEL`, `CP_DIR`, `CP_DIM`
 - Initialized in `init_colors()`
 
+### Processes modal (`p`)
+
+- `get_processes()` uses `ps -axwwo pid=,user=,command=` to list processes with the full command line (no width truncation).
+- `get_listen_ports()` parses `lsof -Fpn -P -n -iTCP -sTCP:LISTEN` and `-iUDP` output into a `pid -> ["tcp:port", ...]` map.
+- `get_process_env(pid, command)`: reads `/proc/<pid>/environ` on Linux; on macOS uses `ps eww -p <pid> -o command=` and strips the known command prefix, parsing the trailing `KEY=VALUE` tokens.
+- `filter_processes(procs, query)`: space-separated tokens, all must appear in `command + ports + pid + user` lowercased; tokens prefixed with `-` exclude matches.
+- `shorten_middle(s, width)`: replaces the middle of a long string with `...` to fit `width`.
+- Modal state on `App`: `proc_mode`, `proc_list`, `proc_filter`, `proc_cursor`, `proc_offset`, `proc_focus` (`filter`/`list`/`env`), `proc_env_cache`, `proc_env_offset`, `proc_kill_confirm`.
+- `Tab` cycles `filter` → `list` → `env`; the env section is scrollable with arrow/PgUp/PgDn/Home/End when focused.
+- `k` (list focus) or `Ctrl-K` (any focus) triggers a `y/N` kill confirmation drawn on the bottom border; accepted keystroke calls `os.kill(pid, 9)`.
+
 ## Development
 
 - `pyproject.toml` is for local dev tooling only (black settings); `xc.py` is self-contained

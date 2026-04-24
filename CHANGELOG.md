@@ -6,6 +6,23 @@ and this project loosely follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.22] - 2026-04-24
+
+### Added
+
+- `p` opens a process modal listing all running processes with PID, user,
+  command (middle-truncated with `...`), and listening TCP/UDP ports.
+- Filter input at the top: space-separated words all must match command
+  or ports (or pid/user); words prefixed with `-` exclude matches.
+- Full command line of the selected process is shown below the list.
+- Environment variables of the selected process are shown below the
+  command line (via `/proc/<pid>/environ` on Linux, `ps eww` on macOS).
+- `Tab` cycles focus between filter, list and env sections; when env is
+  focused, arrow/PgUp/PgDn/Home/End scroll the env list.
+- `k` (in list focus) or `Ctrl-K` (any focus) sends SIGKILL to the
+  selected process after a `y/N` confirmation.
+- `Ctrl-R` refreshes the process list.
+
 ## [0.2.21] - 2026-04-23
 
 ### Changed

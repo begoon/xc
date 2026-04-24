@@ -40,7 +40,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-VERSION = "0.2.21"
+VERSION = "0.2.22"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -1891,6 +1891,170 @@ def vfs_join(fs: VFS, base: str, name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Processes
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ProcInfo:
+    pid: int
+    user: str
+    command: str
+    ports: list[str] = field(default_factory=list)
+
+
+def get_processes() -> list[ProcInfo]:
+    try:
+        out = subprocess.run(
+            ["ps", "-axwwo", "pid=,user=,command="],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    result: list[ProcInfo] = []
+    for line in out.splitlines():
+        parts = line.lstrip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        result.append(ProcInfo(pid=pid, user=parts[1], command=parts[2]))
+    return result
+
+
+def get_listen_ports() -> dict[int, list[str]]:
+    ports: dict[int, list[str]] = {}
+    probes = (
+        ("tcp", ["-iTCP", "-sTCP:LISTEN"]),
+        ("udp", ["-iUDP"]),
+    )
+    for proto, extra in probes:
+        cmd = ["lsof", "-P", "-n", "-Fpn"] + extra
+        try:
+            out = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=10
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        pid = 0
+        for line in out.splitlines():
+            if not line:
+                continue
+            tag, val = line[0], line[1:]
+            if tag == "p":
+                try:
+                    pid = int(val)
+                except ValueError:
+                    pid = 0
+            elif tag == "n" and pid:
+                host_port = val.split("->", 1)[0]
+                port = host_port.rsplit(":", 1)[-1]
+                if port.isdigit():
+                    entry = f"{proto}:{port}"
+                    lst = ports.setdefault(pid, [])
+                    if entry not in lst:
+                        lst.append(entry)
+    return ports
+
+
+def get_process_env(pid: int, command: str) -> list[tuple[str, str]]:
+    proc_env = Path(f"/proc/{pid}/environ")
+    if proc_env.exists():
+        try:
+            data = proc_env.read_bytes()
+        except OSError:
+            return []
+        pairs: list[tuple[str, str]] = []
+        for item in data.split(b"\0"):
+            if not item:
+                continue
+            s = item.decode("utf-8", errors="replace")
+            if "=" in s:
+                k, v = s.split("=", 1)
+                pairs.append((k, v))
+        return pairs
+    try:
+        out = subprocess.run(
+            ["ps", "eww", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout.rstrip("\n")
+    except (OSError, subprocess.SubprocessError):
+        return []
+    tail = out
+    if tail.startswith(command):
+        tail = tail[len(command) :].lstrip()
+    import re as _re
+
+    env_re = _re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+    tokens = tail.split(" ") if tail else []
+    pairs_m: list[tuple[str, str]] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if env_re.match(tok):
+            buf = [tok]
+            j = i + 1
+            while j < len(tokens) and not env_re.match(tokens[j]):
+                buf.append(tokens[j])
+                j += 1
+            combined = " ".join(buf)
+            k, _, v = combined.partition("=")
+            pairs_m.append((k, v))
+            i = j
+        else:
+            i += 1
+    return pairs_m
+
+
+def filter_processes(procs: list[ProcInfo], query: str) -> list[ProcInfo]:
+    tokens = [w for w in query.lower().split() if w]
+    includes: list[str] = []
+    excludes: list[str] = []
+    for t in tokens:
+        if t.startswith("-") and len(t) > 1:
+            excludes.append(t[1:])
+        else:
+            includes.append(t)
+    if not includes and not excludes:
+        return procs
+    out = []
+    for p in procs:
+        hay = (
+            p.command.lower()
+            + " "
+            + " ".join(p.ports).lower()
+            + " "
+            + str(p.pid)
+            + " "
+            + p.user.lower()
+        )
+        if all(w in hay for w in includes) and not any(
+            w in hay for w in excludes
+        ):
+            out.append(p)
+    return out
+
+
+def shorten_middle(s: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if len(s) <= width:
+        return s
+    if width <= 3:
+        return s[:width]
+    keep = width - 3
+    left = keep // 2 + keep % 2
+    right = keep - left
+    return s[:left] + "..." + (s[-right:] if right else "")
+
+
+# ---------------------------------------------------------------------------
 # Color pairs
 # ---------------------------------------------------------------------------
 
@@ -2039,6 +2203,17 @@ class App:
         self.ctrl_c_pending = False
         self.help_mode = False
         self.cursor_pos: tuple[int, int] | None = None  # (y, x) for cursor
+        # Process list modal
+        self.proc_mode = False
+        self.proc_list: list[ProcInfo] = []
+        self.proc_filter: list[str] = []
+        self.proc_cursor = 0
+        self.proc_offset = 0
+        self.proc_focus = "filter"  # "filter", "list", or "env"
+        self.proc_env_cache: dict[int, list[tuple[str, str]]] = {}
+        self.proc_env_offset = 0
+        self._proc_env_count = 0
+        self.proc_kill_confirm: int = 0  # pid awaiting y/n
 
         local_fs = LocalFS()
         probes: list[VFS] = [
@@ -3024,6 +3199,8 @@ class App:
             self.draw_cmd_history(w, h)
         if self.help_mode:
             self.draw_help()
+        if self.proc_mode:
+            self.draw_proc_modal()
 
         if self.cursor_pos:
             curses.curs_set(1)
@@ -3374,6 +3551,7 @@ class App:
             "  Ctrl-C ×2     quit",
             "  q             quit",
             "  h             this help",
+            "  p             processes",
         ]
         h, w = self.scr.getmaxyx()
         box_w = max(len(line) for line in lines) + 6
@@ -3403,6 +3581,431 @@ class App:
         for i, line in enumerate(lines):
             a = attr_title if line and not line.startswith(" ") else attr
             self.draw_string(x0 + 3, y0 + 2 + i, line, box_w - 6, a)
+
+    # -- Processes --
+
+    def action_processes(self) -> None:
+        self.proc_mode = True
+        self.proc_focus = "filter"
+        self.proc_filter = []
+        self.proc_cursor = 0
+        self.proc_offset = 0
+        self.proc_env_offset = 0
+        self.proc_env_cache = {}
+        self.proc_kill_confirm = 0
+        self.reload_processes()
+
+    def reload_processes(self) -> None:
+        procs = get_processes()
+        ports = get_listen_ports()
+        for p in procs:
+            p.ports = ports.get(p.pid, [])
+        self.proc_list = procs
+        self.proc_env_cache = {}
+
+    def current_proc_filtered(self) -> list[ProcInfo]:
+        return filter_processes(self.proc_list, "".join(self.proc_filter))
+
+    def selected_proc(self) -> ProcInfo | None:
+        filtered = self.current_proc_filtered()
+        if not filtered:
+            return None
+        if self.proc_cursor < 0:
+            self.proc_cursor = 0
+        if self.proc_cursor >= len(filtered):
+            self.proc_cursor = len(filtered) - 1
+        return filtered[self.proc_cursor]
+
+    def draw_proc_modal(self) -> None:
+        h, w = self.scr.getmaxyx()
+        box_w = max(60, w - 4)
+        box_h = max(20, h - 2)
+        if box_w > w:
+            box_w = w
+        if box_h > h:
+            box_h = h
+        x0 = (w - box_w) // 2
+        y0 = (h - box_h) // 2
+        attr = curses.color_pair(CP_MENU)
+        attr_title = curses.color_pair(CP_MENU) | curses.A_BOLD
+        attr_sel = curses.color_pair(CP_MENUSEL)
+        attr_border = curses.color_pair(CP_MENU)
+
+        # fill background
+        for dy in range(box_h):
+            self.draw_string(x0, y0 + dy, "", box_w, attr)
+        # border
+        self.set_cell(x0, y0, curses.ACS_ULCORNER, attr_border)
+        self.set_cell(x0 + box_w - 1, y0, curses.ACS_URCORNER, attr_border)
+        self.set_cell(x0, y0 + box_h - 1, curses.ACS_LLCORNER, attr_border)
+        self.set_cell(
+            x0 + box_w - 1, y0 + box_h - 1, curses.ACS_LRCORNER, attr_border
+        )
+        for i in range(1, box_w - 1):
+            self.set_cell(x0 + i, y0, curses.ACS_HLINE, attr_border)
+            self.set_cell(x0 + i, y0 + box_h - 1, curses.ACS_HLINE, attr_border)
+        for i in range(1, box_h - 1):
+            self.set_cell(x0, y0 + i, curses.ACS_VLINE, attr_border)
+            self.set_cell(x0 + box_w - 1, y0 + i, curses.ACS_VLINE, attr_border)
+
+        title = " Processes "
+        tx = x0 + (box_w - len(title)) // 2
+        self.draw_string(tx, y0, title, len(title), attr_title)
+
+        inner_x = x0 + 2
+        inner_w = box_w - 4
+
+        # Layout inside the box
+        # row 0: filter
+        # row 1: column headers
+        # rows 2..list_end: process list
+        # separator
+        # full command: 2 lines
+        # separator
+        # env: rest
+        filter_y = y0 + 2
+        header_y = y0 + 4
+        list_top = y0 + 5
+        env_lines_reserve = max(6, box_h // 3)
+        full_cmd_lines = 2
+        # bottom area: list_bottom = box_h - 2 - env_lines - 1 (sep) - full_cmd - 1 (sep)
+        bottom_info_height = env_lines_reserve + 1 + full_cmd_lines + 1
+        list_bottom = y0 + box_h - 2 - bottom_info_height
+        if list_bottom < list_top + 1:
+            list_bottom = list_top + 1
+        list_visible = list_bottom - list_top
+
+        full_cmd_y = list_bottom + 1
+        env_start_y = full_cmd_y + full_cmd_lines + 1
+
+        # Filter row
+        focus_mark = ">" if self.proc_focus == "filter" else " "
+        filter_label = f"{focus_mark} Filter: "
+        filter_text = "".join(self.proc_filter)
+        self.draw_string(
+            inner_x, filter_y, filter_label + filter_text, inner_w, attr
+        )
+        if self.proc_focus == "filter" and not self.proc_kill_confirm:
+            cur_x = inner_x + len(filter_label) + len(filter_text)
+            if cur_x < x0 + box_w - 1:
+                self.cursor_pos = (filter_y, cur_x)
+
+        # Column headers
+        pid_w = 7
+        user_w = 10
+        ports_w = 14
+        cmd_w = inner_w - pid_w - user_w - ports_w - 3
+        if cmd_w < 10:
+            cmd_w = 10
+        header = (
+            "PID".ljust(pid_w)
+            + " "
+            + "USER".ljust(user_w)
+            + " "
+            + "COMMAND".ljust(cmd_w)
+            + " "
+            + "PORTS".ljust(ports_w)
+        )
+        self.draw_string(inner_x, header_y, header, inner_w, attr_title)
+
+        # Filtered list
+        filtered = self.current_proc_filtered()
+        if self.proc_cursor >= len(filtered):
+            self.proc_cursor = max(0, len(filtered) - 1)
+        if self.proc_cursor < 0:
+            self.proc_cursor = 0
+        if self.proc_cursor < self.proc_offset:
+            self.proc_offset = self.proc_cursor
+        if self.proc_cursor >= self.proc_offset + list_visible:
+            self.proc_offset = self.proc_cursor - list_visible + 1
+        if self.proc_offset < 0:
+            self.proc_offset = 0
+
+        for i in range(list_visible):
+            idx = self.proc_offset + i
+            if idx >= len(filtered):
+                break
+            p = filtered[idx]
+            ports_str = ",".join(p.ports)
+            row = (
+                str(p.pid).rjust(pid_w - 1).ljust(pid_w)
+                + " "
+                + shorten_middle(p.user, user_w).ljust(user_w)
+                + " "
+                + shorten_middle(p.command, cmd_w).ljust(cmd_w)
+                + " "
+                + shorten_middle(ports_str, ports_w).ljust(ports_w)
+            )
+            style = (
+                attr_sel
+                if idx == self.proc_cursor and self.proc_focus == "list"
+                else (
+                    attr_sel | curses.A_DIM if idx == self.proc_cursor else attr
+                )
+            )
+            self.draw_string(inner_x, list_top + i, row, inner_w, style)
+
+        # Separator
+        for i in range(inner_w):
+            self.set_cell(
+                inner_x + i, list_bottom, curses.ACS_HLINE, attr_border
+            )
+
+        sel = self.selected_proc()
+        # Full command (may wrap up to full_cmd_lines)
+        if sel:
+            label = f"PID {sel.pid} ({sel.user}) "
+            cmd_text = sel.command
+            full = label + cmd_text
+            for li in range(full_cmd_lines):
+                seg = full[li * inner_w : (li + 1) * inner_w]
+                self.draw_string(
+                    inner_x,
+                    full_cmd_y + li,
+                    seg,
+                    inner_w,
+                    attr_title if li == 0 else attr,
+                )
+
+        # Env separator
+        for i in range(inner_w):
+            self.set_cell(
+                inner_x + i, env_start_y - 1, curses.ACS_HLINE, attr_border
+            )
+        env_focus_mark = ">" if self.proc_focus == "env" else " "
+        env_label = f"{env_focus_mark} Environment:"
+        self.draw_string(inner_x, env_start_y, env_label, inner_w, attr_title)
+
+        env_list_top = env_start_y + 1
+        env_visible = (y0 + box_h - 1) - env_list_top - 1
+        if env_visible < 0:
+            env_visible = 0
+        self._proc_env_count = 0
+        if sel:
+            pairs = self.proc_env_cache.get(sel.pid)
+            if pairs is None:
+                pairs = get_process_env(sel.pid, sel.command)
+                self.proc_env_cache[sel.pid] = pairs
+            pairs_sorted = sorted(pairs, key=lambda kv: kv[0])
+            self._proc_env_count = len(pairs_sorted)
+            if not pairs_sorted:
+                self.proc_env_offset = 0
+                self.draw_string(
+                    inner_x,
+                    env_list_top,
+                    "(no environment available)",
+                    inner_w,
+                    attr | curses.A_DIM,
+                )
+            else:
+                max_off = max(0, len(pairs_sorted) - env_visible)
+                if self.proc_env_offset > max_off:
+                    self.proc_env_offset = max_off
+                if self.proc_env_offset < 0:
+                    self.proc_env_offset = 0
+                off = self.proc_env_offset
+                for i in range(env_visible):
+                    idx = off + i
+                    if idx >= len(pairs_sorted):
+                        break
+                    k, v = pairs_sorted[idx]
+                    line = f"{k}={v}"
+                    self.draw_string(
+                        inner_x,
+                        env_list_top + i,
+                        shorten_middle(line, inner_w),
+                        inner_w,
+                        attr,
+                    )
+                hidden_below = len(pairs_sorted) - off - env_visible
+                if hidden_below > 0 and env_visible > 0:
+                    more = f"... +{hidden_below} more"
+                    self.draw_string(
+                        inner_x,
+                        env_list_top + env_visible - 1,
+                        shorten_middle(more, inner_w),
+                        inner_w,
+                        attr | curses.A_DIM,
+                    )
+                if off > 0:
+                    up_hint = f"^ +{off} above"
+                    self.draw_string(
+                        x0 + box_w - 2 - len(up_hint),
+                        env_start_y,
+                        up_hint,
+                        len(up_hint),
+                        attr | curses.A_DIM,
+                    )
+
+        # Footer hints
+        hints = "Tab:filter/list/env  k:kill  Ctrl-R:refresh  Esc:close"
+        self.draw_string(inner_x, y0 + box_h - 1, "", inner_w, attr_border)
+        self.draw_string(
+            x0 + box_w - 2 - len(hints),
+            y0 + box_h - 1,
+            hints,
+            len(hints),
+            attr,
+        )
+
+        # Kill confirm overlay on the bottom line
+        if self.proc_kill_confirm:
+            msg = f" Kill -9 PID {self.proc_kill_confirm}? (y/N) "
+            mx = x0 + (box_w - len(msg)) // 2
+            self.draw_string(
+                mx,
+                y0 + box_h - 1,
+                msg,
+                len(msg),
+                curses.color_pair(CP_ERR) | curses.A_BOLD,
+            )
+
+    def handle_proc_key(self, key: int) -> None:
+        if self.proc_kill_confirm:
+            if key in (ord("y"), ord("Y")):
+                pid = self.proc_kill_confirm
+                self.proc_kill_confirm = 0
+                try:
+                    os.kill(pid, 9)
+                    self.err_msg = f"sent SIGKILL to pid {pid}"
+                except OSError as e:
+                    self.err_msg = f"kill {pid} failed: {e}"
+                self.reload_processes()
+            else:
+                self.proc_kill_confirm = 0
+            return
+
+        if key == 27:  # ESC
+            self.proc_mode = False
+            return
+        if key == 9:  # Tab: cycle filter -> list -> env -> filter
+            order = ["filter", "list", "env"]
+            try:
+                i = order.index(self.proc_focus)
+            except ValueError:
+                i = 0
+            self.proc_focus = order[(i + 1) % len(order)]
+            if self.proc_focus == "env":
+                self.proc_env_offset = 0
+            return
+
+        page = 10
+
+        # Navigation keys behave per-focus for scrolling
+        if self.proc_focus == "env":
+            env_count = self._proc_env_count
+            if key == curses.KEY_UP or key == 16:  # Ctrl-P
+                self.proc_env_offset = max(0, self.proc_env_offset - 1)
+                return
+            if key == curses.KEY_DOWN or key == 14:  # Ctrl-N
+                self.proc_env_offset = min(
+                    max(0, env_count - 1), self.proc_env_offset + 1
+                )
+                return
+            if key in (curses.KEY_PPAGE, 21):
+                self.proc_env_offset = max(0, self.proc_env_offset - page)
+                return
+            if key in (curses.KEY_NPAGE, 4):
+                self.proc_env_offset = min(
+                    max(0, env_count - 1), self.proc_env_offset + page
+                )
+                return
+            if key == curses.KEY_HOME or key == 1:
+                self.proc_env_offset = 0
+                return
+            if key == curses.KEY_END or key == 5:
+                self.proc_env_offset = max(0, env_count - 1)
+                return
+            if key == 18:  # Ctrl-R
+                self.reload_processes()
+                return
+            if key == 11:  # Ctrl-K
+                sel = self.selected_proc()
+                if sel:
+                    self.proc_kill_confirm = sel.pid
+                return
+            if key in (curses.KEY_BACKSPACE, 127, 8):
+                if self.proc_filter:
+                    self.proc_filter.pop()
+                    self.proc_cursor = 0
+                    self.proc_offset = 0
+                return
+            if 32 <= key <= 0x10FFFF:
+                ch = chr(key)
+                if ch == "k":
+                    sel = self.selected_proc()
+                    if sel:
+                        self.proc_kill_confirm = sel.pid
+                    return
+                if ch == "/":
+                    self.proc_focus = "filter"
+                    return
+                # Other printable switches to filter
+                self.proc_focus = "filter"
+                self.proc_filter.append(ch)
+                self.proc_cursor = 0
+                self.proc_offset = 0
+            return
+
+        filtered = self.current_proc_filtered()
+
+        if key == curses.KEY_UP or key == 16:  # Ctrl-P
+            self.proc_cursor = max(0, self.proc_cursor - 1)
+            self.proc_env_offset = 0
+            return
+        if key == curses.KEY_DOWN or key == 14:  # Ctrl-N
+            self.proc_cursor = min(len(filtered) - 1, self.proc_cursor + 1)
+            self.proc_env_offset = 0
+            return
+        if key in (curses.KEY_PPAGE, 21):  # PgUp / Ctrl-U
+            self.proc_cursor = max(0, self.proc_cursor - page)
+            self.proc_env_offset = 0
+            return
+        if key in (curses.KEY_NPAGE, 4):  # PgDn / Ctrl-D
+            self.proc_cursor = min(len(filtered) - 1, self.proc_cursor + page)
+            self.proc_env_offset = 0
+            return
+        if key == curses.KEY_HOME or key == 1:  # Home / Ctrl-A
+            self.proc_cursor = 0
+            self.proc_env_offset = 0
+            return
+        if key == curses.KEY_END or key == 5:  # End / Ctrl-E
+            self.proc_cursor = max(0, len(filtered) - 1)
+            self.proc_env_offset = 0
+            return
+        if key == 18:  # Ctrl-R
+            self.reload_processes()
+            return
+        if key == 11:  # Ctrl-K
+            sel = self.selected_proc()
+            if sel:
+                self.proc_kill_confirm = sel.pid
+            return
+        if key in (curses.KEY_BACKSPACE, 127, 8):
+            if self.proc_filter:
+                self.proc_filter.pop()
+                self.proc_cursor = 0
+                self.proc_offset = 0
+                self.proc_env_offset = 0
+            return
+
+        if 32 <= key <= 0x10FFFF:
+            ch = chr(key)
+            if self.proc_focus == "list":
+                if ch == "k":
+                    sel = self.selected_proc()
+                    if sel:
+                        self.proc_kill_confirm = sel.pid
+                    return
+                if ch == "/":
+                    self.proc_focus = "filter"
+                    return
+                # Any other printable switches to filter and appends
+                self.proc_focus = "filter"
+            self.proc_filter.append(ch)
+            self.proc_cursor = 0
+            self.proc_offset = 0
+            self.proc_env_offset = 0
 
     # -- Key handling --
 
@@ -3799,6 +4402,9 @@ class App:
         if self.help_mode:
             self.help_mode = False
             return
+        if self.proc_mode:
+            self.handle_proc_key(key)
+            return
         if self.menu_active:
             self.handle_menu_key(key)
             return
@@ -4047,6 +4653,7 @@ def main(stdscr: curses.window) -> None:
     app.add_keymap("r", lambda: app.action_remotes())
     app.add_keymap("s", lambda: app.start_grep(False))
     app.add_keymap("S", lambda: app.start_grep(True))
+    app.add_keymap("p", lambda: app.action_processes())
 
     app.run()
 
