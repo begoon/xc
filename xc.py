@@ -40,7 +40,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-VERSION = "0.2.23"
+VERSION = "0.2.24"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -3976,10 +3976,10 @@ class App:
                     max(0, env_count - 1), self.proc_env_offset + 1
                 )
                 return
-            if key in (curses.KEY_PPAGE, 21):
+            if key in (curses.KEY_PPAGE, curses.KEY_LEFT, 21):
                 self.proc_env_offset = max(0, self.proc_env_offset - page)
                 return
-            if key in (curses.KEY_NPAGE, 4):
+            if key in (curses.KEY_NPAGE, curses.KEY_RIGHT, 4):
                 self.proc_env_offset = min(
                     max(0, env_count - 1), self.proc_env_offset + page
                 )
@@ -4031,11 +4031,11 @@ class App:
             self.proc_cursor = min(len(filtered) - 1, self.proc_cursor + 1)
             self.proc_env_offset = 0
             return
-        if key in (curses.KEY_PPAGE, 21):  # PgUp / Ctrl-U
+        if key in (curses.KEY_PPAGE, curses.KEY_LEFT, 21):  # PgUp / Ctrl-U
             self.proc_cursor = max(0, self.proc_cursor - page)
             self.proc_env_offset = 0
             return
-        if key in (curses.KEY_NPAGE, 4):  # PgDn / Ctrl-D
+        if key in (curses.KEY_NPAGE, curses.KEY_RIGHT, 4):  # PgDn / Ctrl-D
             self.proc_cursor = min(len(filtered) - 1, self.proc_cursor + page)
             self.proc_env_offset = 0
             return
@@ -4280,10 +4280,10 @@ class App:
         if key in (curses.KEY_DOWN, 14):
             self.path_cursor = min(len(entries) - 1, self.path_cursor + 1)
             return
-        if key in (curses.KEY_PPAGE, 21):
+        if key in (curses.KEY_PPAGE, curses.KEY_LEFT, 21):
             self.path_cursor = max(0, self.path_cursor - page)
             return
-        if key in (curses.KEY_NPAGE, 4):
+        if key in (curses.KEY_NPAGE, curses.KEY_RIGHT, 4):
             self.path_cursor = min(len(entries) - 1, self.path_cursor + page)
             return
         if key in (curses.KEY_HOME, 1):
@@ -4308,10 +4308,10 @@ class App:
         if key in (curses.KEY_DOWN, 14):
             self.path_exe_cursor = min(len(exes) - 1, self.path_exe_cursor + 1)
             return
-        if key in (curses.KEY_PPAGE, 21):
+        if key in (curses.KEY_PPAGE, curses.KEY_LEFT, 21):
             self.path_exe_cursor = max(0, self.path_exe_cursor - page)
             return
-        if key in (curses.KEY_NPAGE, 4):
+        if key in (curses.KEY_NPAGE, curses.KEY_RIGHT, 4):
             self.path_exe_cursor = min(
                 len(exes) - 1, self.path_exe_cursor + page
             )

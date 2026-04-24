@@ -6,6 +6,14 @@ and this project loosely follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.24] - 2026-04-24
+
+### Changed
+
+- In the processes modal (list and env sections) and in the PATH viewer
+  (paths and executables modals), `Left` / `Right` now act as
+  `PgUp` / `PgDn` for consistency with the main panels.
+
 ## [0.2.23] - 2026-04-24
 
 ### Added

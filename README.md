@@ -222,7 +222,8 @@ The layout is:
 | Key                              | Action                                              |
 | -------------------------------- | --------------------------------------------------- |
 | `Tab`                            | Cycle focus: filter → list → env                    |
-| `Up` / `Down` / `PgUp` / `PgDn`  | Navigate list (scrolls env when env is focused)     |
+| `Up` / `Down`                    | Navigate one entry up / down                        |
+| `PgUp` / `PgDn` / `Left` / `Right` | Navigate one page up / down                       |
 | `Home` / `End`                   | Jump to first / last entry                          |
 | letters / `Backspace`            | Edit the filter                                     |
 | `k` (list focus) / `Ctrl-K`      | Send `SIGKILL` (`kill -9`) with `y/N` confirmation  |
@@ -237,12 +238,14 @@ Press `o` to open a modal listing every directory in `$PATH` with the number of 
 
 Press `Enter` on an existing entry to open a second modal showing a scrollable list of the executables in that directory.
 
-| Key                                             | Action                             |
-| ----------------------------------------------- | ---------------------------------- |
-| `Up` / `Down` / `PgUp` / `PgDn` / `Home` / `End` | Navigate                          |
-| `Enter`                                         | Show executables in selected path  |
-| `Ctrl-R`                                        | Rescan `$PATH`                     |
-| `Esc`                                           | Close (inner modal first)          |
+| Key                                   | Action                             |
+| ------------------------------------- | ---------------------------------- |
+| `Up` / `Down`                         | Navigate one entry up / down       |
+| `PgUp` / `PgDn` / `Left` / `Right`    | Navigate one page up / down        |
+| `Home` / `End`                        | Jump to first / last entry         |
+| `Enter`                               | Show executables in selected path  |
+| `Ctrl-R`                              | Rescan `$PATH`                     |
+| `Esc`                                 | Close (inner modal first)          |
 
 ### Command history (`Esc` `h`)
 

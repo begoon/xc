@@ -76,7 +76,7 @@ Detection is probe-based: iterate `probes` list, first match wins. Add new VFS t
 - `filter_processes(procs, query)`: space-separated tokens, all must appear in `command + ports + pid + user` lowercased; tokens prefixed with `-` exclude matches.
 - `shorten_middle(s, width)`: replaces the middle of a long string with `...` to fit `width`.
 - Modal state on `App`: `proc_mode`, `proc_list`, `proc_filter`, `proc_cursor`, `proc_offset`, `proc_focus` (`filter`/`list`/`env`), `proc_env_cache`, `proc_env_offset`, `proc_kill_confirm`.
-- `Tab` cycles `filter` → `list` → `env`; the env section is scrollable with arrow/PgUp/PgDn/Home/End when focused.
+- `Tab` cycles `filter` → `list` → `env`; the env section is scrollable with Up/Down/PgUp/PgDn/Home/End when focused. `Left`/`Right` act as PgUp/PgDn in both the process list and the env scroll.
 - `k` (list focus) or `Ctrl-K` (any focus) triggers a `y/N` kill confirmation drawn on the bottom border; accepted keystroke calls `os.kill(pid, 9)`.
 
 ### PATH viewer (`o`)
@@ -86,6 +86,7 @@ Detection is probe-based: iterate `probes` list, first match wins. Add new VFS t
 - Modal state on `App`: `path_mode`, `path_entries`, `path_cursor`, `path_offset`, plus nested `path_exe_mode`, `path_exe_list`, `path_exe_cursor`, `path_exe_offset`, `path_exe_path`.
 - Enter on an existing PATH entry opens a second modal (drawn on top via `draw_path_exe_modal`) with the executables list. Esc dismisses the inner modal first, then the outer one.
 - `_draw_box(x0, y0, w, h, title)` is a helper used by both modals for the framed rectangle with centered title.
+- `Left`/`Right` act as PgUp/PgDn in both the paths and executables modals.
 
 ## Development
 
