@@ -40,7 +40,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-VERSION = "0.2.25"
+VERSION = "0.2.26"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -3605,43 +3605,53 @@ class App:
             )
 
     def draw_help(self) -> None:
-        lines = [
-            "Navigation",
-            "  ↑/↓  j        move cursor",
-            "  Enter         enter directory / open file",
-            "  Backspace     go to parent directory",
-            "  Tab           switch panel",
-            "  PgUp/PgDn     page up / page down",
-            "  Home/End      first / last file",
-            "  Space         tag file",
-            "  +/_           tag all / untag all",
-            "",
-            "Menus",
-            "  x             command menu",
-            "  e             edit/view menu",
-            "  b             bookmark menu",
-            "  r             remotes",
-            "",
-            "Commands",
-            "  ;             command line (shell)",
-            "  :             command line (internal)",
-            "  s/S           search / search with grep",
-            "  /             search in file list",
-            "  i             calculate directory sizes",
-            "",
-            "Other",
-            "  ESC ESC       show main screen",
-            "  Ctrl-L        reload panel",
-            "  Ctrl-C ×2     quit",
-            "  q             quit",
-            "  h             this help",
-            "  p             processes",
-            "  o             PATH viewer",
-            "  k             env variables",
+        columns = [
+            [
+                "Navigation",
+                "  ↑/↓  j        move cursor",
+                "  Enter         enter directory / open file",
+                "  Backspace     go to parent directory",
+                "  Tab           switch panel",
+                "  PgUp/PgDn     page up / page down",
+                "  Home/End      first / last file",
+                "  Space         tag file",
+                "  +/_           tag all / untag all",
+                "",
+                "Menus",
+                "  x             command menu",
+                "  e             edit/view menu",
+                "  b             bookmark menu",
+                "  r             remotes",
+            ],
+            [
+                "Commands",
+                "  ;             command line (shell)",
+                "  :             command line (internal)",
+                "  s/S           search / search with grep",
+                "  /             search in file list",
+                "  i             calculate directory sizes",
+                "",
+                "Viewers",
+                "  p             processes",
+                "  o             PATH viewer",
+                "  k             env variables",
+                "",
+                "Other",
+                "  ESC ESC       show main screen",
+                "  Ctrl-L        reload panel",
+                "  Ctrl-C ×2     quit",
+                "  q             quit",
+                "  h             this help",
+            ],
         ]
+        col_widths = [max(len(line) for line in col) for col in columns]
+        col_gap = 3
+        rows = max(len(col) for col in columns)
         h, w = self.scr.getmaxyx()
-        box_w = max(len(line) for line in lines) + 6
-        box_h = len(lines) + 4
+        pad_x = 3
+        pad_y = 2
+        box_w = sum(col_widths) + col_gap * (len(columns) - 1) + pad_x * 2
+        box_h = rows + pad_y * 2
         x0 = (w - box_w) // 2
         y0 = (h - box_h) // 2
         attr = curses.color_pair(CP_MENU)
@@ -3664,9 +3674,12 @@ class App:
             self.set_cell(x0, y0 + i, curses.ACS_VLINE, attr_border)
             self.set_cell(x0 + box_w - 1, y0 + i, curses.ACS_VLINE, attr_border)
         # content
-        for i, line in enumerate(lines):
-            a = attr_title if line and not line.startswith(" ") else attr
-            self.draw_string(x0 + 3, y0 + 2 + i, line, box_w - 6, a)
+        cx = x0 + pad_x
+        for ci, col in enumerate(columns):
+            for ri, line in enumerate(col):
+                a = attr_title if line and not line.startswith(" ") else attr
+                self.draw_string(cx, y0 + pad_y + ri, line, col_widths[ci], a)
+            cx += col_widths[ci] + col_gap
 
     # -- Processes --
 

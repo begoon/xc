@@ -6,6 +6,13 @@ and this project loosely follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.26] - 2026-04-24
+
+### Changed
+
+- Help panel (`h`) is now laid out in two columns (Navigation+Menus,
+  Commands+Viewers+Other), reducing its height.
+
 ## [0.2.25] - 2026-04-24
 
 ### Added
