@@ -40,7 +40,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-VERSION = "0.2.22"
+VERSION = "0.2.23"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -2041,6 +2041,67 @@ def filter_processes(procs: list[ProcInfo], query: str) -> list[ProcInfo]:
     return out
 
 
+@dataclass
+class PathEntry:
+    path: str
+    exists: bool
+    count: int
+
+
+def _count_executables(expanded: str) -> int:
+    count = 0
+    try:
+        names = os.listdir(expanded)
+    except OSError:
+        return 0
+    for name in names:
+        full = os.path.join(expanded, name)
+        try:
+            st = os.stat(full)
+        except OSError:
+            continue
+        if not stat.S_ISDIR(st.st_mode) and (st.st_mode & 0o111):
+            count += 1
+    return count
+
+
+def list_path_entries() -> list[PathEntry]:
+    raw = os.environ.get("PATH", "")
+    parts = raw.split(os.pathsep)
+    seen: set[str] = set()
+    entries: list[PathEntry] = []
+    for p in parts:
+        if not p or p in seen:
+            continue
+        seen.add(p)
+        expanded = expand_home(p)
+        if not os.path.isdir(expanded):
+            entries.append(PathEntry(path=p, exists=False, count=0))
+            continue
+        entries.append(
+            PathEntry(path=p, exists=True, count=_count_executables(expanded))
+        )
+    return entries
+
+
+def list_executables(path: str) -> list[str]:
+    expanded = expand_home(path)
+    result: list[str] = []
+    try:
+        names = sorted(os.listdir(expanded))
+    except OSError:
+        return []
+    for name in names:
+        full = os.path.join(expanded, name)
+        try:
+            st = os.stat(full)
+        except OSError:
+            continue
+        if not stat.S_ISDIR(st.st_mode) and (st.st_mode & 0o111):
+            result.append(name)
+    return result
+
+
 def shorten_middle(s: str, width: int) -> str:
     if width <= 0:
         return ""
@@ -2214,6 +2275,16 @@ class App:
         self.proc_env_offset = 0
         self._proc_env_count = 0
         self.proc_kill_confirm: int = 0  # pid awaiting y/n
+        # PATH viewer modal
+        self.path_mode = False
+        self.path_entries: list[PathEntry] = []
+        self.path_cursor = 0
+        self.path_offset = 0
+        self.path_exe_mode = False
+        self.path_exe_list: list[str] = []
+        self.path_exe_cursor = 0
+        self.path_exe_offset = 0
+        self.path_exe_path = ""
 
         local_fs = LocalFS()
         probes: list[VFS] = [
@@ -3201,6 +3272,8 @@ class App:
             self.draw_help()
         if self.proc_mode:
             self.draw_proc_modal()
+        if self.path_mode:
+            self.draw_path_modal()
 
         if self.cursor_pos:
             curses.curs_set(1)
@@ -3552,6 +3625,7 @@ class App:
             "  q             quit",
             "  h             this help",
             "  p             processes",
+            "  o             PATH viewer",
         ]
         h, w = self.scr.getmaxyx()
         box_w = max(len(line) for line in lines) + 6
@@ -4007,6 +4081,248 @@ class App:
             self.proc_offset = 0
             self.proc_env_offset = 0
 
+    # -- PATH viewer --
+
+    def action_path_viewer(self) -> None:
+        self.path_mode = True
+        self.path_exe_mode = False
+        self.path_entries = list_path_entries()
+        self.path_cursor = 0
+        self.path_offset = 0
+        self.path_exe_list = []
+        self.path_exe_cursor = 0
+        self.path_exe_offset = 0
+        self.path_exe_path = ""
+
+    def _draw_box(
+        self,
+        x0: int,
+        y0: int,
+        box_w: int,
+        box_h: int,
+        title: str,
+    ) -> None:
+        attr = curses.color_pair(CP_MENU)
+        attr_title = curses.color_pair(CP_MENU) | curses.A_BOLD
+        attr_border = curses.color_pair(CP_MENU)
+        for dy in range(box_h):
+            self.draw_string(x0, y0 + dy, "", box_w, attr)
+        self.set_cell(x0, y0, curses.ACS_ULCORNER, attr_border)
+        self.set_cell(x0 + box_w - 1, y0, curses.ACS_URCORNER, attr_border)
+        self.set_cell(x0, y0 + box_h - 1, curses.ACS_LLCORNER, attr_border)
+        self.set_cell(
+            x0 + box_w - 1, y0 + box_h - 1, curses.ACS_LRCORNER, attr_border
+        )
+        for i in range(1, box_w - 1):
+            self.set_cell(x0 + i, y0, curses.ACS_HLINE, attr_border)
+            self.set_cell(x0 + i, y0 + box_h - 1, curses.ACS_HLINE, attr_border)
+        for i in range(1, box_h - 1):
+            self.set_cell(x0, y0 + i, curses.ACS_VLINE, attr_border)
+            self.set_cell(x0 + box_w - 1, y0 + i, curses.ACS_VLINE, attr_border)
+        if title:
+            tx = x0 + (box_w - len(title)) // 2
+            self.draw_string(tx, y0, title, len(title), attr_title)
+
+    def draw_path_modal(self) -> None:
+        h, w = self.scr.getmaxyx()
+        box_w = min(max(60, w - 8), w)
+        box_h = min(max(15, h - 4), h)
+        x0 = (w - box_w) // 2
+        y0 = (h - box_h) // 2
+        self._draw_box(x0, y0, box_w, box_h, " PATH ")
+
+        attr = curses.color_pair(CP_MENU)
+        attr_sel = curses.color_pair(CP_MENUSEL)
+        attr_err = curses.color_pair(CP_ERR) | curses.A_BOLD
+
+        inner_x = x0 + 2
+        inner_w = box_w - 4
+        list_top = y0 + 2
+        list_bottom = y0 + box_h - 2
+        list_visible = list_bottom - list_top
+
+        entries = self.path_entries
+        if self.path_cursor >= len(entries):
+            self.path_cursor = max(0, len(entries) - 1)
+        if self.path_cursor < self.path_offset:
+            self.path_offset = self.path_cursor
+        if self.path_cursor >= self.path_offset + list_visible:
+            self.path_offset = self.path_cursor - list_visible + 1
+        if self.path_offset < 0:
+            self.path_offset = 0
+
+        count_w = 12
+        path_w = inner_w - count_w - 1
+
+        for i in range(list_visible):
+            idx = self.path_offset + i
+            if idx >= len(entries):
+                break
+            e = entries[idx]
+            if e.exists:
+                info = f"{e.count} files"
+                style = attr_sel if idx == self.path_cursor else attr
+            else:
+                info = "missing"
+                style = (
+                    attr_sel
+                    if idx == self.path_cursor
+                    else (attr | curses.A_DIM)
+                )
+            row = (
+                shorten_middle(e.path, path_w).ljust(path_w)
+                + " "
+                + info.rjust(count_w)
+            )
+            if not e.exists and idx != self.path_cursor:
+                self.draw_string(inner_x, list_top + i, row, inner_w, attr_err)
+            else:
+                self.draw_string(inner_x, list_top + i, row, inner_w, style)
+
+        hints = "Enter:executables  Esc:close"
+        self.draw_string(
+            x0 + box_w - 2 - len(hints),
+            y0 + box_h - 1,
+            hints,
+            len(hints),
+            attr,
+        )
+        # Draw executables sub-modal on top if active
+        if self.path_exe_mode:
+            self.draw_path_exe_modal()
+
+    def draw_path_exe_modal(self) -> None:
+        h, w = self.scr.getmaxyx()
+        box_w = min(max(60, w - 12), w)
+        box_h = min(max(15, h - 6), h)
+        x0 = (w - box_w) // 2
+        y0 = (h - box_h) // 2
+        title = f" {shorten_middle(self.path_exe_path, box_w - 4)} "
+        self._draw_box(x0, y0, box_w, box_h, title)
+
+        attr = curses.color_pair(CP_MENU)
+        attr_sel = curses.color_pair(CP_MENUSEL)
+
+        inner_x = x0 + 2
+        inner_w = box_w - 4
+        list_top = y0 + 2
+        list_bottom = y0 + box_h - 2
+        list_visible = list_bottom - list_top
+
+        exes = self.path_exe_list
+        if self.path_exe_cursor >= len(exes):
+            self.path_exe_cursor = max(0, len(exes) - 1)
+        if self.path_exe_cursor < self.path_exe_offset:
+            self.path_exe_offset = self.path_exe_cursor
+        if self.path_exe_cursor >= self.path_exe_offset + list_visible:
+            self.path_exe_offset = self.path_exe_cursor - list_visible + 1
+        if self.path_exe_offset < 0:
+            self.path_exe_offset = 0
+
+        if not exes:
+            self.draw_string(
+                inner_x,
+                list_top,
+                "(no executables)",
+                inner_w,
+                attr | curses.A_DIM,
+            )
+        else:
+            for i in range(list_visible):
+                idx = self.path_exe_offset + i
+                if idx >= len(exes):
+                    break
+                name = exes[idx]
+                style = attr_sel if idx == self.path_exe_cursor else attr
+                self.draw_string(
+                    inner_x,
+                    list_top + i,
+                    shorten_middle(name, inner_w),
+                    inner_w,
+                    style,
+                )
+
+        footer = f" {len(exes)} executables "
+        hints = "Esc:back"
+        self.draw_string(x0 + 2, y0 + box_h - 1, footer, len(footer), attr)
+        self.draw_string(
+            x0 + box_w - 2 - len(hints),
+            y0 + box_h - 1,
+            hints,
+            len(hints),
+            attr,
+        )
+
+    def handle_path_key(self, key: int) -> None:
+        if self.path_exe_mode:
+            self._handle_path_exe_key(key)
+            return
+
+        page = 10
+        entries = self.path_entries
+
+        if key == 27:  # ESC
+            self.path_mode = False
+            return
+        if key in (curses.KEY_ENTER, 10, 13):
+            if 0 <= self.path_cursor < len(entries):
+                e = entries[self.path_cursor]
+                if e.exists:
+                    self.path_exe_path = e.path
+                    self.path_exe_list = list_executables(e.path)
+                    self.path_exe_cursor = 0
+                    self.path_exe_offset = 0
+                    self.path_exe_mode = True
+            return
+        if key in (curses.KEY_UP, 16):
+            self.path_cursor = max(0, self.path_cursor - 1)
+            return
+        if key in (curses.KEY_DOWN, 14):
+            self.path_cursor = min(len(entries) - 1, self.path_cursor + 1)
+            return
+        if key in (curses.KEY_PPAGE, 21):
+            self.path_cursor = max(0, self.path_cursor - page)
+            return
+        if key in (curses.KEY_NPAGE, 4):
+            self.path_cursor = min(len(entries) - 1, self.path_cursor + page)
+            return
+        if key in (curses.KEY_HOME, 1):
+            self.path_cursor = 0
+            return
+        if key in (curses.KEY_END, 5):
+            self.path_cursor = max(0, len(entries) - 1)
+            return
+        if key == 18:  # Ctrl-R
+            self.path_entries = list_path_entries()
+            return
+
+    def _handle_path_exe_key(self, key: int) -> None:
+        page = 10
+        exes = self.path_exe_list
+        if key == 27:  # ESC
+            self.path_exe_mode = False
+            return
+        if key in (curses.KEY_UP, 16):
+            self.path_exe_cursor = max(0, self.path_exe_cursor - 1)
+            return
+        if key in (curses.KEY_DOWN, 14):
+            self.path_exe_cursor = min(len(exes) - 1, self.path_exe_cursor + 1)
+            return
+        if key in (curses.KEY_PPAGE, 21):
+            self.path_exe_cursor = max(0, self.path_exe_cursor - page)
+            return
+        if key in (curses.KEY_NPAGE, 4):
+            self.path_exe_cursor = min(
+                len(exes) - 1, self.path_exe_cursor + page
+            )
+            return
+        if key in (curses.KEY_HOME, 1):
+            self.path_exe_cursor = 0
+            return
+        if key in (curses.KEY_END, 5):
+            self.path_exe_cursor = max(0, len(exes) - 1)
+            return
+
     # -- Key handling --
 
     def cmd_insert_string(self, s: str) -> None:
@@ -4405,6 +4721,9 @@ class App:
         if self.proc_mode:
             self.handle_proc_key(key)
             return
+        if self.path_mode:
+            self.handle_path_key(key)
+            return
         if self.menu_active:
             self.handle_menu_key(key)
             return
@@ -4654,6 +4973,7 @@ def main(stdscr: curses.window) -> None:
     app.add_keymap("s", lambda: app.start_grep(False))
     app.add_keymap("S", lambda: app.start_grep(True))
     app.add_keymap("p", lambda: app.action_processes())
+    app.add_keymap("o", lambda: app.action_path_viewer())
 
     app.run()
 

@@ -6,6 +6,17 @@ and this project loosely follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.23] - 2026-04-24
+
+### Added
+
+- `o` opens a PATH viewer modal listing each entry in `$PATH` with the
+  number of executable files it contains, or `missing` if the directory
+  does not exist.
+- Pressing Enter on an existing PATH entry opens a second scrollable
+  modal listing the executables in that directory.
+- `Ctrl-R` refreshes the PATH listing.
+
 ## [0.2.22] - 2026-04-24
 
 ### Added

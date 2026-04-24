@@ -231,6 +231,19 @@ The layout is:
 
 Listening ports are gathered via `lsof -iTCP -sTCP:LISTEN -iUDP`. On machines where `lsof` is restricted or not installed, the ports column will simply be empty.
 
+### PATH viewer (`o`)
+
+Press `o` to open a modal listing every directory in `$PATH` with the number of executable files it contains. Missing directories are flagged as `missing` (dimmed and coloured as errors).
+
+Press `Enter` on an existing entry to open a second modal showing a scrollable list of the executables in that directory.
+
+| Key                                             | Action                             |
+| ----------------------------------------------- | ---------------------------------- |
+| `Up` / `Down` / `PgUp` / `PgDn` / `Home` / `End` | Navigate                          |
+| `Enter`                                         | Show executables in selected path  |
+| `Ctrl-R`                                        | Rescan `$PATH`                     |
+| `Esc`                                           | Close (inner modal first)          |
+
 ### Command history (`Esc` `h`)
 
 In command-line mode (`;` or `:`), press `Esc` then `h` to open a history selector showing previously executed commands. Use `Up` / `Down` to browse, `Enter` to accept, `Esc` to cancel. History is persisted across sessions (up to 100 entries).

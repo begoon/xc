@@ -79,6 +79,14 @@ Detection is probe-based: iterate `probes` list, first match wins. Add new VFS t
 - `Tab` cycles `filter` → `list` → `env`; the env section is scrollable with arrow/PgUp/PgDn/Home/End when focused.
 - `k` (list focus) or `Ctrl-K` (any focus) triggers a `y/N` kill confirmation drawn on the bottom border; accepted keystroke calls `os.kill(pid, 9)`.
 
+### PATH viewer (`o`)
+
+- `list_path_entries()` splits `$PATH` on `os.pathsep`, deduplicates, and counts executable files (`st_mode & 0o111`, non-dir) per directory. Missing directories produce a `PathEntry(exists=False)`.
+- `list_executables(path)` returns sorted executable file names in a directory.
+- Modal state on `App`: `path_mode`, `path_entries`, `path_cursor`, `path_offset`, plus nested `path_exe_mode`, `path_exe_list`, `path_exe_cursor`, `path_exe_offset`, `path_exe_path`.
+- Enter on an existing PATH entry opens a second modal (drawn on top via `draw_path_exe_modal`) with the executables list. Esc dismisses the inner modal first, then the outer one.
+- `_draw_box(x0, y0, w, h, title)` is a helper used by both modals for the framed rectangle with centered title.
+
 ## Development
 
 - `pyproject.toml` is for local dev tooling only (black settings); `xc.py` is self-contained
