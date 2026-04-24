@@ -40,7 +40,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-VERSION = "0.2.24"
+VERSION = "0.2.25"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -2084,6 +2084,10 @@ def list_path_entries() -> list[PathEntry]:
     return entries
 
 
+def list_current_env() -> list[tuple[str, str]]:
+    return sorted(os.environ.items(), key=lambda kv: kv[0])
+
+
 def list_executables(path: str) -> list[str]:
     expanded = expand_home(path)
     result: list[str] = []
@@ -2275,6 +2279,11 @@ class App:
         self.proc_env_offset = 0
         self._proc_env_count = 0
         self.proc_kill_confirm: int = 0  # pid awaiting y/n
+        # Env variables viewer modal
+        self.envv_mode = False
+        self.envv_list: list[tuple[str, str]] = []
+        self.envv_cursor = 0
+        self.envv_offset = 0
         # PATH viewer modal
         self.path_mode = False
         self.path_entries: list[PathEntry] = []
@@ -3274,6 +3283,8 @@ class App:
             self.draw_proc_modal()
         if self.path_mode:
             self.draw_path_modal()
+        if self.envv_mode:
+            self.draw_env_modal()
 
         if self.cursor_pos:
             curses.curs_set(1)
@@ -3596,7 +3607,7 @@ class App:
     def draw_help(self) -> None:
         lines = [
             "Navigation",
-            "  ↑/↓  k/j     move cursor",
+            "  ↑/↓  j        move cursor",
             "  Enter         enter directory / open file",
             "  Backspace     go to parent directory",
             "  Tab           switch panel",
@@ -3626,6 +3637,7 @@ class App:
             "  h             this help",
             "  p             processes",
             "  o             PATH viewer",
+            "  k             env variables",
         ]
         h, w = self.scr.getmaxyx()
         box_w = max(len(line) for line in lines) + 6
@@ -4323,6 +4335,131 @@ class App:
             self.path_exe_cursor = max(0, len(exes) - 1)
             return
 
+    # -- Env viewer --
+
+    def action_env_viewer(self) -> None:
+        self.envv_mode = True
+        self.envv_list = list_current_env()
+        self.envv_cursor = 0
+        self.envv_offset = 0
+
+    def draw_env_modal(self) -> None:
+        h, w = self.scr.getmaxyx()
+        box_w = min(max(60, w - 4), w)
+        box_h = min(max(20, h - 2), h)
+        x0 = (w - box_w) // 2
+        y0 = (h - box_h) // 2
+        self._draw_box(x0, y0, box_w, box_h, " Environment ")
+
+        attr = curses.color_pair(CP_MENU)
+        attr_title = curses.color_pair(CP_MENU) | curses.A_BOLD
+        attr_sel = curses.color_pair(CP_MENUSEL)
+
+        inner_x = x0 + 2
+        inner_w = box_w - 4
+
+        # Layout: list top ... separator ... full value area (4 lines)
+        full_area_h = max(4, box_h // 4)
+        list_top = y0 + 2
+        list_bottom = y0 + box_h - 2 - full_area_h - 1
+        if list_bottom < list_top + 1:
+            list_bottom = list_top + 1
+        list_visible = list_bottom - list_top
+
+        entries = self.envv_list
+        if self.envv_cursor >= len(entries):
+            self.envv_cursor = max(0, len(entries) - 1)
+        if self.envv_cursor < 0:
+            self.envv_cursor = 0
+        if self.envv_cursor < self.envv_offset:
+            self.envv_offset = self.envv_cursor
+        if self.envv_cursor >= self.envv_offset + list_visible:
+            self.envv_offset = self.envv_cursor - list_visible + 1
+        if self.envv_offset < 0:
+            self.envv_offset = 0
+
+        for i in range(list_visible):
+            idx = self.envv_offset + i
+            if idx >= len(entries):
+                break
+            k, v = entries[idx]
+            line = f"{k}={v}"
+            style = attr_sel if idx == self.envv_cursor else attr
+            self.draw_string(
+                inner_x,
+                list_top + i,
+                shorten_middle(line, inner_w),
+                inner_w,
+                style,
+            )
+
+        # Separator
+        for i in range(inner_w):
+            self.set_cell(
+                inner_x + i, list_bottom, curses.ACS_HLINE, attr | curses.A_DIM
+            )
+
+        # Full value of selected var (wrapped across full_area_h lines)
+        full_y = list_bottom + 1
+        if entries:
+            k, v = entries[self.envv_cursor]
+            self.draw_string(inner_x, full_y, k, inner_w, attr_title)
+            for li in range(full_area_h - 1):
+                seg = v[li * inner_w : (li + 1) * inner_w]
+                if not seg and li > 0:
+                    break
+                self.draw_string(inner_x, full_y + 1 + li, seg, inner_w, attr)
+            # Indicator if value truncated beyond full_area_h - 1 lines
+            shown_chars = (full_area_h - 1) * inner_w
+            if len(v) > shown_chars:
+                more = f"... +{len(v) - shown_chars} chars"
+                self.draw_string(
+                    x0 + box_w - 2 - len(more),
+                    full_y + full_area_h - 1,
+                    more,
+                    len(more),
+                    attr | curses.A_DIM,
+                )
+
+        hints = "Esc:close"
+        self.draw_string(
+            x0 + box_w - 2 - len(hints),
+            y0 + box_h - 1,
+            hints,
+            len(hints),
+            attr,
+        )
+        footer = f" {len(entries)} vars "
+        self.draw_string(x0 + 2, y0 + box_h - 1, footer, len(footer), attr)
+
+    def handle_env_key(self, key: int) -> None:
+        page = 10
+        entries = self.envv_list
+        if key == 27:  # ESC
+            self.envv_mode = False
+            return
+        if key in (curses.KEY_UP, 16):
+            self.envv_cursor = max(0, self.envv_cursor - 1)
+            return
+        if key in (curses.KEY_DOWN, 14):
+            self.envv_cursor = min(len(entries) - 1, self.envv_cursor + 1)
+            return
+        if key in (curses.KEY_PPAGE, curses.KEY_LEFT, 21):
+            self.envv_cursor = max(0, self.envv_cursor - page)
+            return
+        if key in (curses.KEY_NPAGE, curses.KEY_RIGHT, 4):
+            self.envv_cursor = min(len(entries) - 1, self.envv_cursor + page)
+            return
+        if key in (curses.KEY_HOME, 1):
+            self.envv_cursor = 0
+            return
+        if key in (curses.KEY_END, 5):
+            self.envv_cursor = max(0, len(entries) - 1)
+            return
+        if key == 18:  # Ctrl-R
+            self.envv_list = list_current_env()
+            return
+
     # -- Key handling --
 
     def cmd_insert_string(self, s: str) -> None:
@@ -4724,6 +4861,9 @@ class App:
         if self.path_mode:
             self.handle_path_key(key)
             return
+        if self.envv_mode:
+            self.handle_env_key(key)
+            return
         if self.menu_active:
             self.handle_menu_key(key)
             return
@@ -4974,6 +5114,7 @@ def main(stdscr: curses.window) -> None:
     app.add_keymap("S", lambda: app.start_grep(True))
     app.add_keymap("p", lambda: app.action_processes())
     app.add_keymap("o", lambda: app.action_path_viewer())
+    app.add_keymap("k", lambda: app.action_env_viewer())
 
     app.run()
 

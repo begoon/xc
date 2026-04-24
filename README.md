@@ -86,7 +86,7 @@ On startup the active panel opens in the current working directory. The inactive
 
 | Key                  | Action                                 |
 | -------------------- | -------------------------------------- |
-| `Up` / `k`           | Move cursor up                         |
+| `Up` / `Ctrl-P`      | Move cursor up                         |
 | `Down` / `j`         | Move cursor down                       |
 | `Enter`              | Enter directory or open VFS            |
 | `Backspace`          | Go to parent directory (or exit VFS)   |
@@ -246,6 +246,18 @@ Press `Enter` on an existing entry to open a second modal showing a scrollable l
 | `Enter`                               | Show executables in selected path  |
 | `Ctrl-R`                              | Rescan `$PATH`                     |
 | `Esc`                                 | Close (inner modal first)          |
+
+### Environment variables (`k`)
+
+Press `k` to open a modal listing every variable from the current process environment, sorted by key. Each row is `KEY=value`; long values are middle-truncated with `...` in the list. The full value of the selected variable is displayed below the list.
+
+| Key                                   | Action                             |
+| ------------------------------------- | ---------------------------------- |
+| `Up` / `Down`                         | Navigate one entry up / down       |
+| `PgUp` / `PgDn` / `Left` / `Right`    | Navigate one page up / down        |
+| `Home` / `End`                        | Jump to first / last entry         |
+| `Ctrl-R`                              | Refresh the env list               |
+| `Esc`                                 | Close the modal                    |
 
 ### Command history (`Esc` `h`)
 

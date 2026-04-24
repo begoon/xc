@@ -88,6 +88,13 @@ Detection is probe-based: iterate `probes` list, first match wins. Add new VFS t
 - `_draw_box(x0, y0, w, h, title)` is a helper used by both modals for the framed rectangle with centered title.
 - `Left`/`Right` act as PgUp/PgDn in both the paths and executables modals.
 
+### Env variables viewer (`k`)
+
+- `list_current_env()` returns `sorted(os.environ.items())`.
+- Modal state on `App`: `envv_mode`, `envv_list`, `envv_cursor`, `envv_offset`.
+- List rows render as `KEY=value` middle-truncated via `shorten_middle()`; below the list the full value wraps across a fixed-height area. An overflow indicator (`... +N chars`) appears on the last line if the value is longer than the full-value area.
+- Binds `k` as a keymap (was previously vim-style "cursor up" in the main panel; use `Up`/`Ctrl-P` for that now).
+
 ## Development
 
 - `pyproject.toml` is for local dev tooling only (black settings); `xc.py` is self-contained

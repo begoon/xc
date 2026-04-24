@@ -6,6 +6,21 @@ and this project loosely follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.25] - 2026-04-24
+
+### Added
+
+- `k` opens an environment variables viewer modal showing all vars from
+  the current process environment, sorted by key; long values are
+  middle-truncated with `...` in the list, and the full value of the
+  selected variable is displayed below the list.
+- `Ctrl-R` refreshes the env list.
+
+### Changed
+
+- `k` is no longer bound to vim-style "cursor up" in the main panel
+  (use `Up` or `Ctrl-P`). It now opens the env viewer.
+
 ## [0.2.24] - 2026-04-24
 
 ### Changed
