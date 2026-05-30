@@ -40,7 +40,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-VERSION = "0.2.26"
+VERSION = "0.2.30"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -101,7 +101,8 @@ log = logging.getLogger("xc")
 class AppState:
     panels: list[str] = field(default_factory=lambda: ["", ""])
     active: int = 0
-    copy_history: list[list[str]] = field(default_factory=lambda: [[], []])
+    # Per-field input history, keyed by purpose (e.g. "copy.dst", "prompt.mkdir").
+    input_history: dict[str, list[str]] = field(default_factory=dict)
     cmd_history: list[str] = field(default_factory=list)
 
 
@@ -112,7 +113,14 @@ def load_state() -> AppState | None:
         st = AppState()
         st.panels = data.get("panels", ["", ""])
         st.active = data.get("active", 0)
-        st.copy_history = data.get("copy_history", [[], []])
+        st.input_history = data.get("input_history", {})
+        # Migrate legacy two-slot copy history.
+        legacy = data.get("copy_history")
+        if not st.input_history and legacy:
+            if len(legacy) > 0 and legacy[0]:
+                st.input_history["copy.src"] = legacy[0]
+            if len(legacy) > 1 and legacy[1]:
+                st.input_history["copy.dst"] = legacy[1]
         st.cmd_history = data.get("cmd_history", [])
         return st
     except Exception:
@@ -127,7 +135,7 @@ def save_state(st: AppState) -> None:
                 {
                     "panels": st.panels,
                     "active": st.active,
-                    "copy_history": st.copy_history,
+                    "input_history": st.input_history,
                     "cmd_history": st.cmd_history,
                 },
                 indent=2,
@@ -2119,6 +2127,20 @@ def shorten_middle(s: str, width: int) -> str:
     return s[:left] + "..." + (s[-right:] if right else "")
 
 
+def slugify(s: str) -> str:
+    """Lowercase, collapse non-alphanumeric runs to underscores."""
+    out: list[str] = []
+    prev_us = False
+    for ch in s.lower():
+        if ch.isalnum():
+            out.append(ch)
+            prev_us = False
+        elif not prev_us:
+            out.append("_")
+            prev_us = True
+    return "".join(out).strip("_") or "input"
+
+
 # ---------------------------------------------------------------------------
 # Color pairs
 # ---------------------------------------------------------------------------
@@ -2143,6 +2165,8 @@ CP_EXT_JSON = 17
 CP_EXT_REMOTE = 18
 CP_EXT_ARCHIVE = 19
 CP_EXT_ENV = 20
+CP_DLG_RED = 21
+CP_SHADOW = 22
 
 EXT_COLORS: dict[str, int] = {
     ".jpg": CP_EXT_IMAGE,
@@ -2211,6 +2235,8 @@ def init_colors() -> None:
     curses.init_pair(CP_EXT_REMOTE, curses.COLOR_WHITE, curses.COLOR_BLUE)
     curses.init_pair(CP_EXT_ARCHIVE, curses.COLOR_RED, curses.COLOR_BLUE)
     curses.init_pair(CP_EXT_ENV, curses.COLOR_YELLOW, curses.COLOR_BLUE)
+    curses.init_pair(CP_DLG_RED, curses.COLOR_WHITE, curses.COLOR_RED)
+    curses.init_pair(CP_SHADOW, curses.COLOR_BLACK, curses.COLOR_BLACK)
 
 
 # ---------------------------------------------------------------------------
@@ -2245,26 +2271,30 @@ class App:
         self.grep_edit: list[str] = []
         self.grep_cursor = 0
         self.grep_file_pattern = ""
-        self.copy_mode = 0  # 0=off, 1=src, 2=dst
-        self.copy_is_move = False
-        self.copy_from = ""
-        self.copy_edit: list[str] = []
-        self.copy_cursor = 0
-        self.copy_history: list[list[str]] = [[], []]
-        self.copy_hist_idx = -1
-        self.copy_edit_saved: list[str] = []
+        # Per-field input history, keyed by purpose.
+        self.input_history: dict[str, list[str]] = {}
+        # Modal input dialog (replaces inline status-line prompts)
+        self.dlg_active = False
+        self.dlg_title = ""
+        self.dlg_message = ""
+        self.dlg_labels: list[str] = []
+        self.dlg_fields: list[list[str]] = []
+        self.dlg_cursors: list[int] = []
+        self.dlg_buttons: list[str] = []
+        self.dlg_focus = 0  # 0..nfields-1 = field; nfields+i = button i
+        self.dlg_danger = False
+        self.dlg_action: Callable[[list[str]], None] | None = None
+        self.dlg_hist_keys: list[str] = []  # history key per field ("" = none)
+        self.dlg_hist_idx = -1
+        self.dlg_saved: list[str] = []
         self.menus: dict[str, Menu] = {}
         self.menu_active = ""
         self.menu_cursor = 0
         self.menu_offset = 0
         self.menu_stack: list[MenuState] = []
         self.keymaps: dict[str, Callable[[], None]] = {}
-        self.prompt_mode = False
-        self.prompt_label = ""
-        self.prompt_edit: list[str] = []
-        self.prompt_cursor = 0
-        self.prompt_action: Callable[[str], None] | None = None
         self.err_msg = ""
+        self.op_cancelled = False  # set when ESC interrupts a group op
         self.ctrl_c_pending = False
         self.help_mode = False
         self.cursor_pos: tuple[int, int] | None = None  # (y, x) for cursor
@@ -2327,7 +2357,7 @@ class App:
         ]
 
         if saved:
-            self.copy_history = saved.copy_history
+            self.input_history = saved.input_history
             self.cmd_history = saved.cmd_history
             if saved.active in (0, 1):
                 self.active = saved.active
@@ -2378,16 +2408,161 @@ class App:
         initial: str,
         action: Callable[[str], None],
     ) -> None:
-        self.prompt_mode = True
-        self.prompt_label = label
-        self.prompt_edit = list(initial)
-        self.prompt_cursor = len(self.prompt_edit)
-        self.prompt_action = action
+        title = label.strip().rstrip(":").strip() or "Input"
+
+        def run(vals: list[str]) -> None:
+            action(vals[0])
+
+        self.open_dialog(
+            title=title,
+            labels=[""],
+            initials=[initial],
+            buttons=["OK", "Cancel"],
+            action=run,
+            hist_keys=["prompt." + slugify(title)],
+        )
+
+    # -- Modal dialog --
+
+    def open_dialog(
+        self,
+        title: str,
+        labels: list[str],
+        initials: list[str],
+        buttons: list[str],
+        action: Callable[[list[str]], None] | None,
+        message: str = "",
+        danger: bool = False,
+        hist_keys: list[str] | None = None,
+    ) -> None:
+        self.dlg_active = True
+        self.dlg_title = title
+        self.dlg_message = message
+        self.dlg_labels = list(labels)
+        self.dlg_fields = [list(s) for s in initials]
+        self.dlg_cursors = [len(s) for s in self.dlg_fields]
+        self.dlg_buttons = list(buttons)
+        self.dlg_danger = danger
+        self.dlg_action = action
+        self.dlg_focus = 0  # first field, or first button if no fields
+        if hist_keys is None:
+            hist_keys = [""] * len(labels)
+        # Pad/truncate so there is exactly one key per field.
+        keys = list(hist_keys)[: len(labels)]
+        keys += [""] * (len(labels) - len(keys))
+        self.dlg_hist_keys = keys
+        self.dlg_hist_idx = -1
+        self.dlg_saved = []
+
+    def close_dialog(self) -> None:
+        self.dlg_active = False
+        self.dlg_action = None
+        self.dlg_labels = []
+        self.dlg_fields = []
+        self.dlg_cursors = []
+        self.dlg_buttons = []
+        self.dlg_hist_keys = []
+        self.dlg_hist_idx = -1
+        self.dlg_saved = []
+
+    def _dlg_on_button(self) -> bool:
+        return self.dlg_focus >= len(self.dlg_labels)
+
+    def _dlg_field_hist_key(self) -> str:
+        fi = self.dlg_focus
+        if 0 <= fi < len(self.dlg_hist_keys):
+            return self.dlg_hist_keys[fi]
+        return ""
+
+    def _dlg_confirm(self) -> None:
+        action = self.dlg_action
+        vals = ["".join(f) for f in self.dlg_fields]
+        # Record each field's value into its own history before closing.
+        for i, key in enumerate(self.dlg_hist_keys):
+            if key and i < len(vals) and vals[i].strip():
+                self.add_input_history(key, vals[i])
+        self.close_dialog()
+        if action:
+            action(vals)
+
+    def _dlg_activate_button(self, bi: int) -> None:
+        # Convention: the last button cancels; any other confirms.
+        if bi == len(self.dlg_buttons) - 1:
+            self.close_dialog()
+        else:
+            self._dlg_confirm()
+
+    def _dlg_history_items(self) -> list[str]:
+        key = self._dlg_field_hist_key()
+        if not key:
+            return []
+        return self.input_history.get(key, [])[:8]
+
+    def _dlg_history_prev(self) -> None:
+        # Up = walk toward older entries (items are newest-first).
+        items = self._dlg_history_items()
+        if not items:
+            return
+        fi = self.dlg_focus
+        if self.dlg_hist_idx < 0:
+            self.dlg_saved = list(self.dlg_fields[fi])
+            self.dlg_hist_idx = 0
+        elif self.dlg_hist_idx < len(items) - 1:
+            self.dlg_hist_idx += 1
+        self.dlg_fields[fi] = list(items[self.dlg_hist_idx])
+        self.dlg_cursors[fi] = len(self.dlg_fields[fi])
+
+    def _dlg_history_next(self) -> None:
+        # Down = walk toward newer entries, then back to the typed text.
+        if self.dlg_hist_idx < 0:
+            return
+        items = self._dlg_history_items()
+        fi = self.dlg_focus
+        if self.dlg_hist_idx > 0:
+            self.dlg_hist_idx -= 1
+            self.dlg_fields[fi] = list(items[self.dlg_hist_idx])
+        else:
+            self.dlg_hist_idx = -1
+            self.dlg_fields[fi] = list(self.dlg_saved)
+        self.dlg_cursors[fi] = len(self.dlg_fields[fi])
 
     # -- Error --
 
     def set_error(self, msg: str) -> None:
         self.err_msg = msg
+
+    def progress(self, msg: str) -> bool:
+        """Show group-operation progress in the status line and return True
+        if the user pressed ESC to cancel."""
+        h, w = self.scr.getmaxyx()
+        self.draw_string(0, h - 3, " " + msg, w, curses.color_pair(CP_STATUS))
+        self.scr.refresh()
+        return self.poll_cancel()
+
+    def poll_cancel(self) -> bool:
+        """Non-blocking check for an ESC keypress to cancel a long op."""
+        if self.op_cancelled:
+            return True
+        self.scr.nodelay(True)
+        try:
+            while True:
+                k = self.scr.getch()
+                if k == -1:
+                    break
+                if k == 27:
+                    self.op_cancelled = True
+                    break
+        except curses.error:
+            pass
+        finally:
+            self.scr.nodelay(False)
+        return self.op_cancelled
+
+    def finish_op(self) -> None:
+        """Report the outcome of a finished group operation."""
+        if self.op_cancelled:
+            self.set_error("cancelled")
+        self.op_cancelled = False
 
     # -- State --
 
@@ -2395,7 +2570,7 @@ class App:
         st = AppState(
             panels=[self.panels[0].path, self.panels[1].path],
             active=self.active,
-            copy_history=self.copy_history,
+            input_history=self.input_history,
             cmd_history=self.cmd_history,
         )
         save_state(st)
@@ -2597,21 +2772,55 @@ class App:
 
     def start_copy_or_move(self, is_move: bool) -> None:
         p = self.panels[self.active]
-        self.copy_is_move = is_move
+        other = self.panels[1 - self.active]
+        verb = "Move" if is_move else "Copy"
         if p.tagged:
-            self.copy_from = f"{len(p.tagged)} files"
-            self.copy_mode = 2
-            other = self.panels[1 - self.active]
-            self.copy_edit = list(other.path)
-            self.copy_cursor = len(self.copy_edit)
-            self.copy_hist_idx = -1
+            names = [f.name for f in p.files if p.tagged.get(f.name)]
+            self.open_dialog(
+                title=verb,
+                message=f"{verb} {len(names)} tagged files to:",
+                labels=["to:"],
+                initials=[other.path],
+                buttons=[verb, "Cancel"],
+                action=lambda vals: self._exec_copy_move(
+                    is_move, None, names, vals[0]
+                ),
+                hist_keys=["copy.dst"],
+            )
         else:
             f = p.selected_file()
             if f and f.name != "..":
-                self.copy_mode = 1
-                self.copy_edit = list(f.name)
-                self.copy_cursor = len(self.copy_edit)
-                self.copy_hist_idx = -1
+                self.open_dialog(
+                    title=verb,
+                    labels=["from:", "to:"],
+                    initials=[f.name, other.path],
+                    buttons=[verb, "Cancel"],
+                    action=lambda vals: self._exec_copy_move(
+                        is_move, vals[0], None, vals[1]
+                    ),
+                    hist_keys=["copy.src", "copy.dst"],
+                )
+
+    def _exec_copy_move(
+        self,
+        is_move: bool,
+        src: str | None,
+        names: list[str] | None,
+        dest: str,
+    ) -> None:
+        self.op_cancelled = False
+        if names is not None:
+            self._copy_tagged(names, dest)
+            if is_move and not self.op_cancelled:
+                for name in names:
+                    if self.op_cancelled:
+                        break
+                    self.do_delete(name)
+        else:
+            self.do_copy(src or "", dest)
+            if is_move and not self.op_cancelled:
+                self.do_delete(src or "")
+        self.finish_op()
 
     def do_copy(self, src: str, dest: str) -> None:
         src_panel = self.panels[self.active]
@@ -2640,6 +2849,8 @@ class App:
         dst_fs: VFS,
         dst_path: str,
     ) -> None:
+        if self.progress("Copying " + os.path.basename(src_path)):
+            return
         log.info("copy file from=%s to=%s", src_path, dst_path)
         try:
             inp = src_fs.read_file(src_path)
@@ -2661,6 +2872,8 @@ class App:
         dst_fs: VFS,
         dst_path: str,
     ) -> None:
+        if self.poll_cancel():
+            return
         log.info("copy dir from=%s to=%s", src_path, dst_path)
         try:
             dst_fs.mkdir_all(dst_path)
@@ -2673,6 +2886,8 @@ class App:
             self.set_error(str(e))
             return
         for f in files:
+            if self.op_cancelled:
+                return
             child_src = vfs_join(src_fs, src_path, f.name)
             child_dst = vfs_join(dst_fs, dst_path, f.name)
             if f.is_dir():
@@ -2725,6 +2940,8 @@ class App:
             tar_paths = {tp for tp, _ in tar_to_dest}
             extracted = src_fs.read_files(tar_paths)
             for tp, dp in tar_to_dest:
+                if self.progress("Copying " + os.path.basename(tp)):
+                    break
                 if tp in extracted:
                     log.info("copy file from=%s to=%s", tp, dp)
                     try:
@@ -2738,6 +2955,8 @@ class App:
             self.panels[1].reload()
         else:
             for name in names:
+                if self.op_cancelled:
+                    break
                 self.do_copy(name, dest)
 
     def _collect_tar_tree(
@@ -2775,6 +2994,8 @@ class App:
         if not dp:
             self.set_error("delete not supported in virtual FS")
             return
+        if self.progress("Deleting " + name):
+            return
         log.info("delete path=%s", dp)
         try:
             if os.path.isdir(dp):
@@ -2795,33 +3016,39 @@ class App:
     def action_remove(self) -> None:
         p = self.panels[self.active]
         if p.tagged:
-            self.show_prompt(
-                f"DELETE {len(p.tagged)} files? (y/n): ",
-                "",
-                lambda ans: self._do_remove_tagged(ans),
+            names = [f.name for f in p.files if p.tagged.get(f.name)]
+            self.open_dialog(
+                title="Delete",
+                message=f"Delete {len(names)} tagged files?",
+                labels=[],
+                initials=[],
+                buttons=["Delete", "Cancel"],
+                action=lambda vals: self._do_remove_tagged(),
+                danger=True,
             )
         else:
             f = p.selected_file()
             if f and f.name != "..":
                 name = f.name
-                self.show_prompt(
-                    f"DELETE {name}? (y/n): ",
-                    "",
-                    lambda ans, n=name: self._do_remove_single(ans, n),
+                self.open_dialog(
+                    title="Delete",
+                    message=f"Delete {name}?",
+                    labels=[],
+                    initials=[],
+                    buttons=["Delete", "Cancel"],
+                    action=lambda vals, n=name: self.do_delete(n),
+                    danger=True,
                 )
 
-    def _do_remove_tagged(self, ans: str) -> None:
-        if ans != "y":
-            return
+    def _do_remove_tagged(self) -> None:
         p = self.panels[self.active]
         names = [f.name for f in p.files if p.tagged.get(f.name)]
+        self.op_cancelled = False
         for n in names:
+            if self.op_cancelled:
+                break
             self.do_delete(n)
-
-    def _do_remove_single(self, ans: str, name: str) -> None:
-        if ans != "y":
-            return
-        self.do_delete(name)
+        self.finish_op()
 
     def action_mkdir(self) -> None:
         def do_it(name: str) -> None:
@@ -3166,29 +3393,14 @@ class App:
         else:
             calc_for(p.selected_file())
 
-    # -- Copy history --
+    # -- Input history --
 
-    def filtered_copy_history(self) -> list[str]:
-        idx = self.copy_mode - 1
-        if idx < 0 or idx > 1:
-            return []
-        query = "".join(self.copy_edit)
-        if self.copy_hist_idx >= 0:
-            query = "".join(self.copy_edit_saved)
-        query = query.lower()
-        matches = []
-        for h in self.copy_history[idx]:
-            if not query or query in h.lower():
-                matches.append(h)
-                if len(matches) >= 5:
-                    break
-        return matches
-
-    def add_copy_history(self, idx: int, val: str) -> None:
-        hist = [h for h in self.copy_history[idx] if h != val]
-        self.copy_history[idx] = [val] + hist
-        if len(self.copy_history[idx]) > 20:
-            self.copy_history[idx] = self.copy_history[idx][:20]
+    def add_input_history(self, key: str, val: str) -> None:
+        hist = [h for h in self.input_history.get(key, []) if h != val]
+        hist = [val] + hist
+        if len(hist) > 20:
+            hist = hist[:20]
+        self.input_history[key] = hist
 
     def add_cmd_history(self, val: str) -> None:
         hist = [h for h in self.cmd_history if h != val]
@@ -3273,8 +3485,6 @@ class App:
 
         if self.menu_active:
             self.draw_menu()
-        if self.copy_mode > 0:
-            self.draw_copy_history(w, h)
         if self.cmd_hist_mode:
             self.draw_cmd_history(w, h)
         if self.help_mode:
@@ -3285,6 +3495,8 @@ class App:
             self.draw_path_modal()
         if self.envv_mode:
             self.draw_env_modal()
+        if self.dlg_active:
+            self.draw_dialog()
 
         if self.cursor_pos:
             curses.curs_set(1)
@@ -3462,29 +3674,6 @@ class App:
 
     def draw_cmd_line(self, x: int, y: int, w: int) -> None:
         attr = curses.color_pair(CP_CMDLINE)
-        if self.prompt_mode:
-            pw = len(self.prompt_label)
-            self.draw_string(x, y, self.prompt_label, pw, attr)
-            edit_w = w - pw
-            text = "".join(self.prompt_edit)
-            self.draw_string(x + pw, y, text, edit_w, attr)
-            self.cursor_pos = (y, x + pw + self.prompt_cursor)
-            return
-
-        if self.copy_mode > 0:
-            verb = "Move" if self.copy_is_move else "Copy"
-            if self.copy_mode == 1:
-                prompt = f"{verb} from "
-            else:
-                prompt = f"{verb} from {self.copy_from} to "
-            pw = len(prompt)
-            self.draw_string(x, y, prompt, pw, attr)
-            edit_w = w - pw
-            text = "".join(self.copy_edit)
-            self.draw_string(x + pw, y, text, edit_w, attr)
-            self.cursor_pos = (y, x + pw + self.copy_cursor)
-            return
-
         if self.grep_mode > 0:
             if self.grep_mode == 1:
                 prompt = "search "
@@ -3565,20 +3754,6 @@ class App:
             line = f" {item.key}  {item.label}"
             style = attr_sel if idx == self.menu_cursor else attr_menu
             self.draw_string(panel_x + 1, row_y, line, inner_w, style)
-
-    def draw_copy_history(self, screen_w: int, screen_h: int) -> None:
-        items = self.filtered_copy_history()
-        if not items:
-            return
-        cmd_y = screen_h - 2
-        attr = curses.color_pair(CP_CMDLINE)
-        attr_sel = curses.color_pair(CP_CURSOR)
-        for i, item in enumerate(items):
-            row_y = cmd_y - len(items) + i
-            if row_y < 0:
-                continue
-            style = attr_sel if i == self.copy_hist_idx else attr
-            self.draw_string(0, row_y, " " + item, screen_w, style)
 
     def draw_cmd_history(self, screen_w: int, screen_h: int) -> None:
         if not self.cmd_history:
@@ -4119,6 +4294,16 @@ class App:
         self.path_exe_offset = 0
         self.path_exe_path = ""
 
+    def _draw_shadow(self, x0: int, y0: int, box_w: int, box_h: int) -> None:
+        sh = curses.color_pair(CP_SHADOW)
+        # Right edge (2 cols), shifted one row down.
+        for dy in range(1, box_h + 1):
+            self.set_cell(x0 + box_w, y0 + dy, " ", sh)
+            self.set_cell(x0 + box_w + 1, y0 + dy, " ", sh)
+        # Bottom edge, shifted two cols right.
+        for dx in range(2, box_w):
+            self.set_cell(x0 + dx, y0 + box_h, " ", sh)
+
     def _draw_box(
         self,
         x0: int,
@@ -4126,10 +4311,12 @@ class App:
         box_w: int,
         box_h: int,
         title: str,
+        attr: int | None = None,
     ) -> None:
-        attr = curses.color_pair(CP_MENU)
-        attr_title = curses.color_pair(CP_MENU) | curses.A_BOLD
-        attr_border = curses.color_pair(CP_MENU)
+        if attr is None:
+            attr = curses.color_pair(CP_MENU)
+        attr_title = attr | curses.A_BOLD
+        attr_border = attr
         for dy in range(box_h):
             self.draw_string(x0, y0 + dy, "", box_w, attr)
         self.set_cell(x0, y0, curses.ACS_ULCORNER, attr_border)
@@ -4147,6 +4334,139 @@ class App:
         if title:
             tx = x0 + (box_w - len(title)) // 2
             self.draw_string(tx, y0, title, len(title), attr_title)
+
+    def draw_dialog(self) -> None:
+        h, w = self.scr.getmaxyx()
+        nf = len(self.dlg_labels)
+        nb = len(self.dlg_buttons)
+        has_msg = bool(self.dlg_message)
+        maxlabel = max([len(l) for l in self.dlg_labels], default=0)
+
+        btn_texts = [f"[ {b} ]" for b in self.dlg_buttons]
+        buttons_w = sum(len(t) for t in btn_texts) + 2 * max(nb - 1, 0)
+
+        desired_input = 46
+        field_w = (maxlabel + 1 + desired_input) if nf else 0
+        title_disp = f" {self.dlg_title} "
+        inner_need = max(
+            len(self.dlg_message),
+            field_w,
+            buttons_w,
+            len(title_disp),
+        )
+        box_w = inner_need + 4
+        box_w = min(box_w, w - 4)
+        box_w = max(box_w, 24)
+
+        # Interior row layout (offsets from first interior row).
+        interior = 1  # top padding
+        msg_r = -1
+        if has_msg:
+            msg_r = interior
+            interior += 2  # message + blank
+        field_rs: list[int] = []
+        for _ in range(nf):
+            field_rs.append(interior)
+            interior += 1
+        if nf:
+            interior += 1  # blank between fields and buttons
+        btn_r = interior
+        interior += 1
+        interior += 1  # bottom padding
+        box_h = interior + 2
+
+        x0 = (w - box_w) // 2
+        y0 = (h - box_h) // 2
+        if x0 + box_w + 2 > w:
+            x0 = w - box_w - 2
+        if y0 + box_h + 1 > h:
+            y0 = h - box_h - 1
+        x0 = max(0, x0)
+        y0 = max(0, y0)
+
+        base = CP_DLG_RED if self.dlg_danger else CP_MENU
+        attr = curses.color_pair(base)
+        attr_field = curses.color_pair(CP_STATUS)
+
+        self._draw_shadow(x0, y0, box_w, box_h)
+        self._draw_box(x0, y0, box_w, box_h, title_disp, attr)
+
+        interior_x = x0 + 2
+        interior_w = box_w - 4
+        row_y = y0 + 1  # first interior row
+
+        if has_msg:
+            self.draw_string(
+                interior_x,
+                row_y + msg_r,
+                self.dlg_message,
+                interior_w,
+                attr | curses.A_BOLD,
+            )
+
+        input_x = interior_x + maxlabel + 1
+        input_w = max(interior_w - maxlabel - 1, 1)
+        self.cursor_pos = None
+        focused_fy = -1
+        for i, fr in enumerate(field_rs):
+            fy = row_y + fr
+            if self.dlg_labels[i]:
+                self.draw_string(
+                    interior_x, fy, self.dlg_labels[i], maxlabel, attr
+                )
+            text = "".join(self.dlg_fields[i])
+            cur = self.dlg_cursors[i]
+            view = 0
+            if cur > input_w - 1:
+                view = cur - input_w + 1
+            visible = text[view : view + input_w]
+            self.draw_string(input_x, fy, visible, input_w, attr_field)
+            if self.dlg_focus == i:
+                self.cursor_pos = (fy, input_x + (cur - view))
+                focused_fy = fy
+
+        # Buttons row, centered.
+        bx = interior_x + max((interior_w - buttons_w) // 2, 0)
+        by = row_y + btn_r
+        for bi, t in enumerate(btn_texts):
+            focused = self.dlg_focus == nf + bi
+            battr = (attr | curses.A_REVERSE) if focused else attr
+            self.draw_string(bx, by, t, len(t), battr)
+            bx += len(t) + 2
+
+        # History dropdown for the focused field (drawn on top, below the box).
+        if focused_fy >= 0 and not self._dlg_on_button():
+            items = self._dlg_history_items()
+            if items:
+                self._draw_dlg_history(
+                    input_x, y0, box_w, box_h, input_w, items
+                )
+
+    def _draw_dlg_history(
+        self,
+        list_x: int,
+        y0: int,
+        box_w: int,
+        box_h: int,
+        list_w: int,
+        items: list[str],
+    ) -> None:
+        h, w = self.scr.getmaxyx()
+        n = len(items)
+        list_w = min(max(list_w, 10), w - list_x - 1)
+        list_y = y0 + box_h  # just below the dialog box
+        if list_y + n + 1 > h:  # not enough room below → place above the box
+            list_y = max(0, y0 - n)
+        attr = curses.color_pair(CP_CMDLINE)
+        attr_sel = curses.color_pair(CP_CURSOR)
+        self._draw_shadow(list_x, list_y - 1, list_w, n + 1)
+        for i, item in enumerate(items):
+            ry = list_y + i
+            if ry < 0 or ry >= h:
+                continue
+            style = attr_sel if i == self.dlg_hist_idx else attr
+            shown = " " + shorten_middle(item, list_w - 1)
+            self.draw_string(list_x, ry, shown, list_w, style)
 
     def draw_path_modal(self) -> None:
         h, w = self.scr.getmaxyx()
@@ -4484,43 +4804,89 @@ class App:
         )
         self.cmd_cursor += len(chars)
 
-    def handle_prompt_key(self, key: int) -> None:
+    def handle_dialog_key(self, key: int) -> None:
+        nf = len(self.dlg_labels)
+        nb = len(self.dlg_buttons)
+        total = nf + nb
+        if total == 0:
+            self.close_dialog()
+            return
+
         if key == 27:  # ESC
-            self.prompt_mode = False
-        elif key in (curses.KEY_ENTER, 10, 13):
-            self.prompt_mode = False
-            if self.prompt_action:
-                self.prompt_action("".join(self.prompt_edit))
-        elif key in (curses.KEY_BACKSPACE, 127, 8):
-            if self.prompt_cursor > 0:
-                self.prompt_edit = (
-                    self.prompt_edit[: self.prompt_cursor - 1]
-                    + self.prompt_edit[self.prompt_cursor :]
-                )
-                self.prompt_cursor -= 1
+            self.close_dialog()
+            return
+        if key in (curses.KEY_ENTER, 10, 13):
+            if self._dlg_on_button():
+                self._dlg_activate_button(self.dlg_focus - nf)
+            else:
+                self._dlg_confirm()
+            return
+        if key == 9:  # Tab
+            self.dlg_focus = (self.dlg_focus + 1) % total
+            self.dlg_hist_idx = -1
+            return
+        if key == curses.KEY_BTAB:  # Shift-Tab
+            self.dlg_focus = (self.dlg_focus - 1) % total
+            self.dlg_hist_idx = -1
+            return
+
+        if self._dlg_on_button():
+            bi = self.dlg_focus - nf
+            if key == curses.KEY_LEFT and bi > 0:
+                self.dlg_focus -= 1
+            elif key == curses.KEY_RIGHT and bi < nb - 1:
+                self.dlg_focus += 1
+            elif key == curses.KEY_UP and nf > 0:
+                self.dlg_focus = nf - 1
+            elif key == ord(" "):
+                self._dlg_activate_button(bi)
+            return
+
+        # Focus is on a text field.
+        fi = self.dlg_focus
+        is_hist = bool(self._dlg_field_hist_key())
+        if key == curses.KEY_UP:
+            if is_hist:
+                self._dlg_history_prev()
+            elif fi > 0:
+                self.dlg_focus -= 1
+            return
+        if key == curses.KEY_DOWN:
+            if is_hist:
+                self._dlg_history_next()
+            elif self.dlg_focus < total - 1:
+                self.dlg_focus += 1
+            return
+
+        edit = self.dlg_fields[fi]
+        cur = self.dlg_cursors[fi]
+        if key in (curses.KEY_BACKSPACE, 127, 8):
+            self.dlg_hist_idx = -1
+            if cur > 0:
+                self.dlg_fields[fi] = edit[: cur - 1] + edit[cur:]
+                self.dlg_cursors[fi] = cur - 1
         elif key == curses.KEY_LEFT:
-            if self.prompt_cursor > 0:
-                self.prompt_cursor -= 1
+            if cur > 0:
+                self.dlg_cursors[fi] = cur - 1
         elif key == curses.KEY_RIGHT:
-            if self.prompt_cursor < len(self.prompt_edit):
-                self.prompt_cursor += 1
+            if cur < len(edit):
+                self.dlg_cursors[fi] = cur + 1
         elif key == 1:  # Ctrl-A
-            self.prompt_cursor = 0
+            self.dlg_cursors[fi] = 0
         elif key == 5:  # Ctrl-E
-            self.prompt_cursor = len(self.prompt_edit)
+            self.dlg_cursors[fi] = len(edit)
         elif key == 21:  # Ctrl-U
-            self.prompt_edit = self.prompt_edit[self.prompt_cursor :]
-            self.prompt_cursor = 0
+            self.dlg_hist_idx = -1
+            self.dlg_fields[fi] = edit[cur:]
+            self.dlg_cursors[fi] = 0
         elif key == 11:  # Ctrl-K
-            self.prompt_edit = self.prompt_edit[: self.prompt_cursor]
+            self.dlg_hist_idx = -1
+            self.dlg_fields[fi] = edit[:cur]
         elif 32 <= key <= 0x10FFFF:
+            self.dlg_hist_idx = -1
             ch = chr(key)
-            self.prompt_edit = (
-                self.prompt_edit[: self.prompt_cursor]
-                + [ch]
-                + self.prompt_edit[self.prompt_cursor :]
-            )
-            self.prompt_cursor += 1
+            self.dlg_fields[fi] = edit[:cur] + [ch] + edit[cur:]
+            self.dlg_cursors[fi] = cur + 1
 
     def handle_menu_key(self, key: int) -> None:
         menu = self.menus.get(self.menu_active)
@@ -4543,96 +4909,6 @@ class App:
                 if item.key == ch:
                     self.exec_menu_item(item)
                     return
-
-    def handle_copy_key(self, key: int) -> None:
-        if key == 27:
-            self.copy_mode = 0
-            return
-        if key in (curses.KEY_ENTER, 10, 13):
-            if self.copy_mode == 1:
-                self.copy_from = "".join(self.copy_edit)
-                self.add_copy_history(0, self.copy_from)
-                other = self.panels[1 - self.active]
-                dest = other.path
-                self.copy_edit = list(dest)
-                self.copy_cursor = len(self.copy_edit)
-                self.copy_hist_idx = -1
-                self.copy_mode = 2
-            else:
-                dest = "".join(self.copy_edit)
-                self.add_copy_history(1, dest)
-                is_move = self.copy_is_move
-                self.copy_mode = 0
-                p = self.panels[self.active]
-                if p.tagged:
-                    names = [f.name for f in p.files if p.tagged.get(f.name)]
-                    self._copy_tagged(names, dest)
-                    if is_move:
-                        for name in names:
-                            self.do_delete(name)
-                else:
-                    self.do_copy(self.copy_from, dest)
-                    if is_move:
-                        self.do_delete(self.copy_from)
-            return
-
-        if key == curses.KEY_UP:
-            items = self.filtered_copy_history()
-            if not items:
-                return
-            if self.copy_hist_idx < 0:
-                self.copy_edit_saved = list(self.copy_edit)
-                self.copy_hist_idx = len(items) - 1
-            elif self.copy_hist_idx > 0:
-                self.copy_hist_idx -= 1
-            self.copy_edit = list(items[self.copy_hist_idx])
-            self.copy_cursor = len(self.copy_edit)
-        elif key == curses.KEY_DOWN:
-            items = self.filtered_copy_history()
-            if self.copy_hist_idx < 0:
-                return
-            if self.copy_hist_idx < len(items) - 1:
-                self.copy_hist_idx += 1
-                self.copy_edit = list(items[self.copy_hist_idx])
-                self.copy_cursor = len(self.copy_edit)
-            else:
-                self.copy_hist_idx = -1
-                self.copy_edit = list(self.copy_edit_saved)
-                self.copy_cursor = len(self.copy_edit)
-        elif key in (curses.KEY_BACKSPACE, 127, 8):
-            self.copy_hist_idx = -1
-            if self.copy_cursor > 0:
-                self.copy_edit = (
-                    self.copy_edit[: self.copy_cursor - 1]
-                    + self.copy_edit[self.copy_cursor :]
-                )
-                self.copy_cursor -= 1
-        elif key == curses.KEY_LEFT:
-            if self.copy_cursor > 0:
-                self.copy_cursor -= 1
-        elif key == curses.KEY_RIGHT:
-            if self.copy_cursor < len(self.copy_edit):
-                self.copy_cursor += 1
-        elif key == 1:  # Ctrl-A
-            self.copy_cursor = 0
-        elif key == 5:  # Ctrl-E
-            self.copy_cursor = len(self.copy_edit)
-        elif key == 21:  # Ctrl-U
-            self.copy_hist_idx = -1
-            self.copy_edit = self.copy_edit[self.copy_cursor :]
-            self.copy_cursor = 0
-        elif key == 11:  # Ctrl-K
-            self.copy_hist_idx = -1
-            self.copy_edit = self.copy_edit[: self.copy_cursor]
-        elif 32 <= key <= 0x10FFFF:
-            self.copy_hist_idx = -1
-            ch = chr(key)
-            self.copy_edit = (
-                self.copy_edit[: self.copy_cursor]
-                + [ch]
-                + self.copy_edit[self.copy_cursor :]
-            )
-            self.copy_cursor += 1
 
     def handle_grep_key(self, key: int) -> None:
         if key == 27:
@@ -4868,6 +5144,9 @@ class App:
         if self.help_mode:
             self.help_mode = False
             return
+        if self.dlg_active:
+            self.handle_dialog_key(key)
+            return
         if self.proc_mode:
             self.handle_proc_key(key)
             return
@@ -4879,12 +5158,6 @@ class App:
             return
         if self.menu_active:
             self.handle_menu_key(key)
-            return
-        if self.prompt_mode:
-            self.handle_prompt_key(key)
-            return
-        if self.copy_mode > 0:
-            self.handle_copy_key(key)
             return
         if self.grep_mode > 0:
             self.handle_grep_key(key)

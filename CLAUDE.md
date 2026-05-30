@@ -88,6 +88,32 @@ Detection is probe-based: iterate `probes` list, first match wins. Add new VFS t
 - `_draw_box(x0, y0, w, h, title)` is a helper used by both modals for the framed rectangle with centered title.
 - `Left`/`Right` act as PgUp/PgDn in both the paths and executables modals.
 
+### Modal input dialog
+
+- All user input that used to prompt inline on the status/command line now goes through a centered modal dialog with a border and a drop shadow (`_draw_shadow`). Replaces the old `prompt_mode`/`copy_mode` inline editing.
+- `open_dialog(title, labels, initials, buttons, action, message="", danger=False, hist_key=-1)` builds a dialog with 0, 1, or 2 stacked input fields plus buttons. `action` receives the list of field values on confirm.
+- `show_prompt()` is now a thin wrapper that opens a single-field dialog (mkdir/touch/chmod/rename/chdir all use it unchanged).
+- Copy/move: single file shows two fields (`from:` / `to:`); tagged shows one (`to:`) with a `Copy 3 tagged files to:` message. `_exec_copy_move()` runs the operation.
+- Delete uses a red dialog (`danger=True`, `CP_DLG_RED`) with a confirmation message and `Delete`/`Cancel` buttons — no input field.
+- Dialog state on `App`: `dlg_active`, `dlg_title`, `dlg_message`, `dlg_labels`, `dlg_fields`, `dlg_cursors`, `dlg_buttons`, `dlg_focus`, `dlg_danger`, `dlg_action`, `dlg_hist_keys`/`dlg_hist_idx`/`dlg_saved`.
+- `handle_dialog_key`: `Tab`/`Shift-Tab` cycle focus over fields then buttons; `Enter` confirms (or cancels on the last button); `ESC` cancels; `Left`/`Right` switch buttons; on any field with a history key `Up`/`Down` walk that field's history (readline-style: first `Up` = most recent). Convention: the last button cancels, any other confirms.
+
+### Per-field input history
+
+- Every dialog field can carry its own history. `open_dialog(..., hist_keys=[...])` takes one key per field (`""` = no history). `_dlg_confirm` records each non-empty field value into `App.input_history[key]` (newest-first, deduped, capped at 20) before running the action.
+- `input_history: dict[str, list[str]]` is persisted in `~/.xc/xc.json`. Legacy two-slot `copy_history` is migrated on load to `copy.src` / `copy.dst`. `add_input_history(key, val)` maintains a list.
+- Keys in use: copy/move single file → `copy.src`, `copy.dst`; tagged → `copy.dst`; `show_prompt` → `prompt.<slug>` via `slugify(title)` (e.g. mkdir → `prompt.mkdir`, rename → `prompt.rename_to`), so each prompt type has independent recall.
+- `_dlg_history_items` returns the focused field's recent entries (newest-first, up to 8, unfiltered — pre-filled field text is NOT used as a filter); `_dlg_history_prev`/`_dlg_history_next` navigate them.
+- When the focused field has history, a dropdown is drawn below the dialog box (`_draw_dlg_history`, with its own shadow) showing the entries; the active entry is highlighted while navigating with `Up`/`Down`. This makes available history visible without pressing a key.
+- `draw_dialog` centers the box, computes size from content, draws the shadow then the box (`_draw_box` now takes an optional `attr`), renders input fields with `CP_STATUS`, and reverse-highlights the focused button.
+
+### Group operation progress / interrupt
+
+- Copy/move/delete of multiple (or recursive) files report the current file in the status line via `App.progress(msg)`, which draws the message and calls `poll_cancel()`.
+- `poll_cancel()` does a non-blocking `getch()` (under `nodelay(True)`); a bare ESC sets `self.op_cancelled`. `_copy_file`/`do_delete` call `progress()`; `_copy_dir` and the tagged/move loops check `op_cancelled` between items and bail early.
+- On move, the source delete phase is skipped entirely if the copy was cancelled (no partial-copy data loss).
+- `finish_op()` resets `op_cancelled` and sets the err line to `cancelled` when interrupted.
+
 ### Env variables viewer (`k`)
 
 - `list_current_env()` returns `sorted(os.environ.items())`.
