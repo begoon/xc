@@ -40,7 +40,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-VERSION = "0.2.30"
+VERSION = "0.2.31"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -1599,21 +1599,23 @@ class Panel:
     def load_dir(self) -> None:
         self.tagged = {}
         self.dir_sizes = {}
-        try:
-            files = self.fs.read_dir(self.path)
-        except Exception as e:
-            self.report_error(e)
-            self.files = []
-            return
         show_dotdot = True
         if isinstance(self.fs, LocalFS):
             parent = os.path.dirname(self.path)
             if parent == self.path:
                 show_dotdot = False
-        if show_dotdot:
-            self.files = [VFile(name="..", file_type=FILE_TYPE_DIR)] + files
-        else:
-            self.files = files
+        base = (
+            [VFile(name="..", file_type=FILE_TYPE_DIR)] if show_dotdot else []
+        )
+        try:
+            files = self.fs.read_dir(self.path)
+        except Exception as e:
+            self.report_error(e)
+            # Keep ".." so the user can still navigate back out of an
+            # unreadable directory instead of being trapped.
+            self.files = base
+            return
+        self.files = base + files
 
     def enter(self) -> None:
         if self.cursor >= len(self.files):
