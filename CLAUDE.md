@@ -107,6 +107,14 @@ Detection is probe-based: iterate `probes` list, first match wins. Add new VFS t
 - When the focused field has history, a dropdown is drawn below the dialog box (`_draw_dlg_history`, with its own shadow) showing the entries; the active entry is highlighted while navigating with `Up`/`Down`. This makes available history visible without pressing a key.
 - `draw_dialog` centers the box, computes size from content, draws the shadow then the box (`_draw_box` now takes an optional `attr`), renders input fields with `CP_STATUS`, and reverse-highlights the focused button.
 
+### Overwrite confirmation
+
+- Copy/move/rename check whether the target already exists before writing. If it does, a red blocking dialog shows the target name plus `new:` / `existing:` lines (size or `<DIR>`, mtime) with buttons `Overwrite / Skip / All / Cancel` (rename: `Overwrite / Cancel`). First-letter hotkeys work; ESC = Cancel.
+- `sync_choice(title, message, buttons, danger)` runs a blocking button-only dialog with its own key loop (usable mid-operation, unlike the async `open_dialog` state machine). `draw_dialog` supports multi-line messages (`\n`-separated; first line bold).
+- `_vfs_stat(fs, path)` returns a `VFile` or `None`: `fs=None`/`LocalFS` uses `os.lstat`; other VFS list the parent dir, cached per operation in `_ow_dir_cache`.
+- `_confirm_overwrite()` consults `overwrite_all` ("All" pressed earlier), prompts via `_ask_overwrite()`; Skip returns False, Cancel/ESC also sets `op_cancelled`. Both are reset in `_exec_copy_move`.
+- `_copy_file`/`_copy_dir`/`do_copy` return True only if fully copied; `_copy_tagged` returns the fully-copied names. Move deletes only those sources, so skipped or failed files are never lost. In the TarFS batch path, overwrite questions are asked before extraction and `owners`/`dir_owners` map each entry back to its tagged name.
+
 ### Group operation progress / interrupt
 
 - Copy/move/delete of multiple (or recursive) files report the current file in the status line via `App.progress(msg)`, which draws the message and calls `poll_cancel()`.

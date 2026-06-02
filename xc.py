@@ -40,7 +40,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-VERSION = "0.2.31"
+VERSION = "0.2.33"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -2297,6 +2297,9 @@ class App:
         self.keymaps: dict[str, Callable[[], None]] = {}
         self.err_msg = ""
         self.op_cancelled = False  # set when ESC interrupts a group op
+        self.overwrite_all = False  # "All" chosen in an overwrite prompt
+        # Per-op cache of destination dir listings for existence checks.
+        self._ow_dir_cache: dict[tuple[int, str], dict[str, VFile]] = {}
         self.ctrl_c_pending = False
         self.help_mode = False
         self.cursor_pos: tuple[int, int] | None = None  # (y, x) for cursor
@@ -2527,6 +2530,144 @@ class App:
             self.dlg_hist_idx = -1
             self.dlg_fields[fi] = list(self.dlg_saved)
         self.dlg_cursors[fi] = len(self.dlg_fields[fi])
+
+    def sync_choice(
+        self,
+        title: str,
+        message: str,
+        buttons: list[str],
+        danger: bool = False,
+    ) -> str:
+        """Blocking button-only dialog usable in the middle of an operation.
+        Returns the chosen button label, or "" on ESC."""
+        self.open_dialog(
+            title=title,
+            labels=[],
+            initials=[],
+            buttons=buttons,
+            action=None,
+            message=message,
+            danger=danger,
+        )
+        choice = ""
+        self.scr.nodelay(False)
+        while True:
+            self.draw()
+            self.scr.refresh()
+            key = self.scr.getch()
+            if key == 27:  # ESC
+                break
+            bi = self.dlg_focus  # no fields: focus is the button index
+            if key in (curses.KEY_ENTER, 10, 13, ord(" ")):
+                choice = self.dlg_buttons[bi]
+                break
+            if key in (curses.KEY_LEFT, curses.KEY_BTAB):
+                self.dlg_focus = (bi - 1) % len(buttons)
+            elif key in (curses.KEY_RIGHT, 9):  # Right / Tab
+                self.dlg_focus = (bi + 1) % len(buttons)
+            elif 32 <= key <= 0x10FFFF:
+                ch = chr(key).lower()
+                for b in buttons:
+                    if b and b[0].lower() == ch:
+                        choice = b
+                        break
+                if choice:
+                    break
+        self.close_dialog()
+        self.draw()
+        self.scr.refresh()
+        return choice
+
+    # -- Overwrite confirmation --
+
+    def _vfs_stat(self, fs: VFS | None, path: str) -> VFile | None:
+        """Return a VFile for path, or None if it does not exist.
+        fs=None or LocalFS stats directly; other VFS list the parent
+        directory (cached per operation in _ow_dir_cache)."""
+        if fs is None or isinstance(fs, LocalFS):
+            try:
+                st = os.lstat(path)
+            except OSError:
+                return None
+            ft = FILE_TYPE_DIR if stat.S_ISDIR(st.st_mode) else FILE_TYPE_FILE
+            return VFile(
+                name=os.path.basename(path),
+                size=st.st_size,
+                file_type=ft,
+                mod_time=st.st_mtime,
+            )
+        parent, _, name = path.rpartition("/")
+        key = (id(fs), parent)
+        listing = self._ow_dir_cache.get(key)
+        if listing is None:
+            try:
+                listing = {f.name: f for f in fs.read_dir(parent or "/")}
+            except Exception:
+                listing = {}
+            self._ow_dir_cache[key] = listing
+        return listing.get(name)
+
+    def _ask_overwrite(
+        self,
+        dst_path: str,
+        new_info: VFile | None,
+        existing_info: VFile | None,
+        buttons: list[str] | None = None,
+    ) -> str:
+        """Show the file-exists dialog; returns the chosen button,
+        lowercased ("cancel" on ESC)."""
+
+        def fmt(label: str, fi: VFile | None) -> str:
+            if fi is None:
+                return f"{label}  ?"
+            size = "<DIR>" if fi.is_dir() else f"{fi.size:,}"
+            if fi.mod_time:
+                dt = datetime.fromtimestamp(fi.mod_time).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+            else:
+                dt = "?"
+            return f"{label}  {size:>15}  {dt}"
+
+        name = os.path.basename(dst_path.rstrip("/")) or dst_path
+        msg = "\n".join(
+            [
+                f"Target already exists: {shorten_name(name, 40)}",
+                "",
+                fmt("new:     ", new_info),
+                fmt("existing:", existing_info),
+            ]
+        )
+        if buttons is None:
+            buttons = ["Overwrite", "Skip", "All", "Cancel"]
+        choice = self.sync_choice("Overwrite", msg, buttons, danger=True)
+        return choice.lower() if choice else "cancel"
+
+    def _confirm_overwrite(
+        self,
+        src_fs: VFS,
+        src_path: str,
+        dst_fs: VFS,
+        dst_path: str,
+    ) -> bool:
+        """If the copy target exists, ask the user. Returns True to
+        proceed; on Skip returns False; on Cancel/ESC also sets
+        op_cancelled to abort the remaining operation."""
+        if self.overwrite_all:
+            return True
+        existing = self._vfs_stat(dst_fs, dst_path)
+        if existing is None:
+            return True
+        new = self._vfs_stat(src_fs, src_path)
+        choice = self._ask_overwrite(dst_path, new, existing)
+        if choice == "all":
+            self.overwrite_all = True
+            return True
+        if choice == "overwrite":
+            return True
+        if choice != "skip":  # cancel / ESC
+            self.op_cancelled = True
+        return False
 
     # -- Error --
 
@@ -2811,20 +2952,26 @@ class App:
         dest: str,
     ) -> None:
         self.op_cancelled = False
+        self.overwrite_all = False
+        self._ow_dir_cache = {}
         if names is not None:
-            self._copy_tagged(names, dest)
+            copied = self._copy_tagged(names, dest)
+            # Only delete sources that were fully copied (nothing
+            # skipped or failed inside them).
             if is_move and not self.op_cancelled:
-                for name in names:
+                for name in copied:
                     if self.op_cancelled:
                         break
                     self.do_delete(name)
         else:
-            self.do_copy(src or "", dest)
-            if is_move and not self.op_cancelled:
+            ok = self.do_copy(src or "", dest)
+            if is_move and ok and not self.op_cancelled:
                 self.do_delete(src or "")
         self.finish_op()
 
-    def do_copy(self, src: str, dest: str) -> None:
+    def do_copy(self, src: str, dest: str) -> bool:
+        """Copy src to dest; returns True if fully copied (safe for a
+        move to delete the source)."""
         src_panel = self.panels[self.active]
         dst_panel = self.panels[1 - self.active]
         src_path = vfs_join(src_panel.fs, src_panel.path, src)
@@ -2838,11 +2985,12 @@ class App:
                 is_dir = f.is_dir()
                 break
         if is_dir:
-            self._copy_dir(src_panel.fs, src_path, dst_panel.fs, dest)
+            ok = self._copy_dir(src_panel.fs, src_path, dst_panel.fs, dest)
         else:
-            self._copy_file(src_panel.fs, src_path, dst_panel.fs, dest)
+            ok = self._copy_file(src_panel.fs, src_path, dst_panel.fs, dest)
         self.panels[0].reload()
         self.panels[1].reload()
+        return ok
 
     def _copy_file(
         self,
@@ -2850,22 +2998,26 @@ class App:
         src_path: str,
         dst_fs: VFS,
         dst_path: str,
-    ) -> None:
+    ) -> bool:
         if self.progress("Copying " + os.path.basename(src_path)):
-            return
+            return False
+        if not self._confirm_overwrite(src_fs, src_path, dst_fs, dst_path):
+            return False
         log.info("copy file from=%s to=%s", src_path, dst_path)
         try:
             inp = src_fs.read_file(src_path)
         except Exception as e:
             self.set_error(str(e))
-            return
+            return False
         try:
             dst_fs.write_file(dst_path, inp)
         except Exception as e:
             self.set_error(str(e))
+            return False
         finally:
             if hasattr(inp, "close"):
                 inp.close()
+        return True
 
     def _copy_dir(
         self,
@@ -2873,31 +3025,35 @@ class App:
         src_path: str,
         dst_fs: VFS,
         dst_path: str,
-    ) -> None:
+    ) -> bool:
         if self.poll_cancel():
-            return
+            return False
         log.info("copy dir from=%s to=%s", src_path, dst_path)
         try:
             dst_fs.mkdir_all(dst_path)
         except Exception as e:
             self.set_error(str(e))
-            return
+            return False
         try:
             files = src_fs.read_dir(src_path)
         except Exception as e:
             self.set_error(str(e))
-            return
+            return False
+        ok = True
         for f in files:
             if self.op_cancelled:
-                return
+                return False
             child_src = vfs_join(src_fs, src_path, f.name)
             child_dst = vfs_join(dst_fs, dst_path, f.name)
             if f.is_dir():
-                self._copy_dir(src_fs, child_src, dst_fs, child_dst)
+                ok &= self._copy_dir(src_fs, child_src, dst_fs, child_dst)
             else:
-                self._copy_file(src_fs, child_src, dst_fs, child_dst)
+                ok &= self._copy_file(src_fs, child_src, dst_fs, child_dst)
+        return ok
 
-    def _copy_tagged(self, names: list[str], dest: str) -> None:
+    def _copy_tagged(self, names: list[str], dest: str) -> list[str]:
+        """Copy tagged names to dest; returns the names that were fully
+        copied (safe for a move to delete)."""
         src_panel = self.panels[self.active]
         dst_panel = self.panels[1 - self.active]
         src_fs = src_panel.fs
@@ -2914,8 +3070,12 @@ class App:
                 else:
                     file_names.append(name)
             # Collect all tar paths for flat files and dir descendants.
+            # owners/dir_owners track which tagged name each entry
+            # belongs to, so failures mark the whole name as not copied.
             tar_to_dest: list[tuple[str, str]] = []
+            owners: list[str] = []
             dirs_to_create: list[str] = []
+            dir_owners: list[str] = []
             for name in file_names:
                 tp = vfs_join(src_fs, src_panel.path, name)
                 d = dest
@@ -2924,6 +3084,7 @@ class App:
                 elif isinstance(dst_panel.fs, LocalFS) and os.path.isdir(d):
                     d = os.path.join(d, name)
                 tar_to_dest.append((tp, d))
+                owners.append(name)
             for name in dir_names:
                 tp = vfs_join(src_fs, src_panel.path, name)
                 d = dest
@@ -2931,17 +3092,38 @@ class App:
                     d += name
                 elif isinstance(dst_panel.fs, LocalFS) and os.path.isdir(d):
                     d = os.path.join(d, name)
+                n_files = len(tar_to_dest)
+                n_dirs = len(dirs_to_create)
                 self._collect_tar_tree(
                     src_fs, tp, d, dst_panel.fs, tar_to_dest, dirs_to_create
                 )
-            for dp in dirs_to_create:
+                owners += [name] * (len(tar_to_dest) - n_files)
+                dir_owners += [name] * (len(dirs_to_create) - n_dirs)
+            failed: set[str] = set()
+            for dp, owner in zip(dirs_to_create, dir_owners):
                 try:
                     dst_panel.fs.mkdir_all(dp)
                 except Exception as e:
                     self.set_error(str(e))
-            tar_paths = {tp for tp, _ in tar_to_dest}
+                    failed.add(owner)
+            # Ask all overwrite questions up front so skipped files are
+            # not extracted at all.
+            skipped: set[int] = set()
+            for i, ((tp, dp), owner) in enumerate(zip(tar_to_dest, owners)):
+                if self.op_cancelled:
+                    return []
+                if not self._confirm_overwrite(src_fs, tp, dst_panel.fs, dp):
+                    skipped.add(i)
+                    failed.add(owner)
+            if self.op_cancelled:
+                return []
+            tar_paths = {
+                tp for i, (tp, _) in enumerate(tar_to_dest) if i not in skipped
+            }
             extracted = src_fs.read_files(tar_paths)
-            for tp, dp in tar_to_dest:
+            for i, ((tp, dp), owner) in enumerate(zip(tar_to_dest, owners)):
+                if i in skipped:
+                    continue
                 if self.progress("Copying " + os.path.basename(tp)):
                     break
                 if tp in extracted:
@@ -2950,16 +3132,23 @@ class App:
                         dst_panel.fs.write_file(dp, extracted[tp])
                     except Exception as e:
                         self.set_error(str(e))
+                        failed.add(owner)
                     dst_panel.reload()
                     self.draw()
                     self.scr.refresh()
+                else:
+                    failed.add(owner)
             self.panels[0].reload()
             self.panels[1].reload()
+            return [n for n in names if n not in failed]
         else:
+            copied: list[str] = []
             for name in names:
                 if self.op_cancelled:
                     break
-                self.do_copy(name, dest)
+                if self.do_copy(name, dest):
+                    copied.append(name)
+            return copied
 
     def _collect_tar_tree(
         self,
@@ -3127,6 +3316,19 @@ class App:
 
         def do_it(new_name: str) -> None:
             new_path = os.path.join(p.path, new_name)
+            try:
+                same = os.path.samefile(dp, new_path)
+            except OSError:
+                same = False
+            if os.path.lexists(new_path) and not same:
+                choice = self._ask_overwrite(
+                    new_path,
+                    self._vfs_stat(None, dp),
+                    self._vfs_stat(None, new_path),
+                    buttons=["Overwrite", "Cancel"],
+                )
+                if choice != "overwrite":
+                    return
             try:
                 os.rename(dp, new_path)
             except Exception as e:
@@ -4342,6 +4544,7 @@ class App:
         nf = len(self.dlg_labels)
         nb = len(self.dlg_buttons)
         has_msg = bool(self.dlg_message)
+        msg_lines = self.dlg_message.split("\n") if has_msg else []
         maxlabel = max([len(l) for l in self.dlg_labels], default=0)
 
         btn_texts = [f"[ {b} ]" for b in self.dlg_buttons]
@@ -4351,7 +4554,7 @@ class App:
         field_w = (maxlabel + 1 + desired_input) if nf else 0
         title_disp = f" {self.dlg_title} "
         inner_need = max(
-            len(self.dlg_message),
+            max((len(l) for l in msg_lines), default=0),
             field_w,
             buttons_w,
             len(title_disp),
@@ -4365,7 +4568,7 @@ class App:
         msg_r = -1
         if has_msg:
             msg_r = interior
-            interior += 2  # message + blank
+            interior += len(msg_lines) + 1  # message lines + blank
         field_rs: list[int] = []
         for _ in range(nf):
             field_rs.append(interior)
@@ -4398,13 +4601,12 @@ class App:
         row_y = y0 + 1  # first interior row
 
         if has_msg:
-            self.draw_string(
-                interior_x,
-                row_y + msg_r,
-                self.dlg_message,
-                interior_w,
-                attr | curses.A_BOLD,
-            )
+            for i, ml in enumerate(msg_lines):
+                # First line bold, detail lines plain.
+                la = (attr | curses.A_BOLD) if i == 0 else attr
+                self.draw_string(
+                    interior_x, row_y + msg_r + i, ml, interior_w, la
+                )
 
         input_x = interior_x + maxlabel + 1
         input_w = max(interior_w - maxlabel - 1, 1)
@@ -5301,7 +5503,7 @@ class App:
 # ---------------------------------------------------------------------------
 
 
-def main(stdscr: curses.window) -> None:
+def main(stdscr: curses.window, dirs: list[str]) -> None:
     init_colors()
     curses.curs_set(0)
 
@@ -5310,14 +5512,18 @@ def main(stdscr: curses.window) -> None:
 
     saved = load_state()
     if saved and saved.active in (0, 1):
-        inactive = 1 - saved.active
-        inactive_dir = saved.panels[inactive] or home
-        if saved.active == 0:
-            left_dir, right_dir = cwd, inactive_dir
-        else:
-            left_dir, right_dir = inactive_dir, cwd
+        active = saved.active
+        inactive_dir = saved.panels[1 - active] or home
     else:
-        left_dir, right_dir = cwd, home
+        active = 0
+        inactive_dir = home
+    active_dir = dirs[0] if dirs else cwd
+    if len(dirs) > 1:
+        inactive_dir = dirs[1]
+    if active == 0:
+        left_dir, right_dir = active_dir, inactive_dir
+    else:
+        left_dir, right_dir = inactive_dir, active_dir
 
     app = App(stdscr, left_dir, right_dir, saved)
 
@@ -5446,13 +5652,22 @@ def self_update() -> None:
 
 
 def entry():
-    if len(sys.argv) > 1 and sys.argv[1] == "-u":
+    args = sys.argv[1:]
+    if args and args[0] == "-u":
         self_update()
         sys.exit(0)
+    if any(a.startswith("-") for a in args) or len(args) > 2:
+        sys.exit(f"usage: {Path(sys.argv[0]).name} [-u] [folder1 [folder2]]")
+    dirs: list[str] = []
+    for a in args:
+        d = os.path.abspath(os.path.expanduser(a))
+        if not os.path.isdir(d):
+            sys.exit(f"not a directory: {a}")
+        dirs.append(d)
     init_logging()
     log.info("starting xc.py")
     try:
-        curses.wrapper(main)
+        curses.wrapper(main, dirs)
     except (SystemExit, KeyboardInterrupt):
         pass
 
