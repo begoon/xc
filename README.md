@@ -60,6 +60,20 @@ chmod +x ~/.local/bin/xc
 xc
 ```
 
+### Command line
+
+```sh
+xc [folder1 [folder2]]
+```
+
+| Argument  | Meaning                                          |
+| --------- | ------------------------------------------------ |
+| `folder1` | Directory to open in the **active** panel        |
+| `folder2` | Directory to open in the other (inactive) panel  |
+| `-u`      | Self-update from GitHub and exit                 |
+
+Paths may be relative and may use `~`. With no arguments, the active panel opens in the current working directory and the inactive panel restores the path from the previous session.
+
 ### Development
 
 The `pyproject.toml` in the repository is only used for local development tooling (e.g. `black` formatter settings). It is **not** needed to run xc -- `xc.py` is fully self-contained with its own inline dependency declarations.
@@ -80,7 +94,7 @@ This fetches the latest `xc.py` from the repository, compares versions, and repl
 
 xc shows two file panels side by side. One panel is **active** (highlighted border), the other is **inactive**. You navigate files in the active panel and use the inactive panel as a target for file operations like copy and move. Press `Tab` to switch the active panel. Press `h` / `l` to activate the left / right panel directly.
 
-On startup the active panel opens in the current working directory. The inactive panel restores the path from the previous session.
+On startup the active panel opens in the current working directory (or `folder1` if given on the command line). The inactive panel restores the path from the previous session (or opens `folder2`).
 
 ### Navigation
 
@@ -116,6 +130,21 @@ Press `x` to open the **command** menu:
 | `g` | **Chdir** -- type a path to navigate to                             |
 
 Copy and move operations use the inactive panel's current path as the default destination. A prompt lets you edit the destination before confirming.
+
+### Overwrite confirmation
+
+If a copy, move, or rename target already exists, a confirmation dialog appears showing the size and modification time of both the new and the existing file (directories are shown as `<DIR>`):
+
+| Button      | Action                                                       |
+| ----------- | ------------------------------------------------------------ |
+| `Overwrite` | Replace the existing file                                    |
+| `Skip`      | Leave the existing file and continue with the remaining ones |
+| `All`       | Overwrite this and all further conflicts without asking      |
+| `Cancel`    | Stop the remaining operation (`Esc` does the same)           |
+
+Buttons respond to their first letter (`o`, `s`, `a`, `c`), `Tab`/arrow keys, and `Enter`. Rename shows only `Overwrite` / `Cancel`.
+
+On move, a source file is deleted only after it has been fully copied -- skipped, cancelled, or failed files always keep their originals. Existence checks work on remote VFS too (the target directory listing is fetched once per operation).
 
 ### Tagging and group operations
 
