@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import bz2
 import curses
+import errno
 import fnmatch
 import gzip
 import io
@@ -23,6 +24,7 @@ import logging
 import lzma
 import os
 import select
+import shlex
 import shutil
 import stat
 import subprocess
@@ -162,6 +164,7 @@ class VFile:
     mod_time: float = 0.0  # unix timestamp
     executable: bool = False
     link_target: str = ""
+    mode: int | None = None
 
     def is_dir(self) -> bool:
         return self.file_type == FILE_TYPE_DIR
@@ -300,6 +303,100 @@ if sys.platform == "darwin" or sys.platform.startswith("linux"):
     ASSOCIATIONS[".json"] = Assoc(cmd="cat %f | jq")
 
 
+@dataclass
+class FileMetadata:
+    mode: int | None = None
+    atime_ns: int | None = None
+    mtime_ns: int | None = None
+    link_target: str | None = None
+
+
+def local_metadata(path: str) -> FileMetadata:
+    st = os.lstat(path)
+    if not (
+        stat.S_ISREG(st.st_mode)
+        or stat.S_ISDIR(st.st_mode)
+        or stat.S_ISLNK(st.st_mode)
+    ):
+        raise OSError(f"copying special files is not supported: {path}")
+    return FileMetadata(
+        stat.S_IMODE(st.st_mode),
+        st.st_atime_ns,
+        st.st_mtime_ns,
+        os.readlink(path) if stat.S_ISLNK(st.st_mode) else None,
+    )
+
+
+def same_local_entry(src: str, dst: str) -> bool:
+    """Compare directory entries without dereferencing symlinks."""
+    try:
+        return os.path.samestat(os.lstat(src), os.lstat(dst))
+    except FileNotFoundError:
+        return False
+
+
+def apply_local_metadata(path: str, metadata: FileMetadata) -> None:
+    is_link = os.path.islink(path)
+    if metadata.mode is not None:
+        if not is_link:
+            os.chmod(path, metadata.mode)
+        elif os.chmod in os.supports_follow_symlinks:
+            os.chmod(path, metadata.mode, follow_symlinks=False)
+    if metadata.mtime_ns is not None:
+        atime = metadata.atime_ns
+        if atime is None:
+            atime = metadata.mtime_ns
+        if not is_link or os.utime in os.supports_follow_symlinks:
+            os.utime(path, ns=(atime, metadata.mtime_ns), follow_symlinks=False)
+
+
+def copy_macos_metadata(src: str, dst: str, flags: int) -> None:
+    """Use copyfile.h flags without following source or destination links."""
+    import ctypes
+
+    native = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+    copyfile = native.copyfile
+    copyfile.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    ]
+    copyfile.restype = ctypes.c_int
+    flags |= (1 << 18) | (1 << 19)
+    if copyfile(os.fsencode(src), os.fsencode(dst), None, flags) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), dst)
+
+
+def copy_local_metadata(
+    src: str, dst: str, metadata: FileMetadata, *, copy_flags: bool = True
+) -> None:
+    """Copy native metadata, then restore the timestamps captured before reading."""
+    source = os.lstat(src)
+    target = os.lstat(dst)
+    if (source.st_uid, source.st_gid) != (target.st_uid, target.st_gid):
+        os.chown(dst, source.st_uid, source.st_gid, follow_symlinks=False)
+    if sys.platform == "darwin":
+        copy_macos_metadata(src, dst, 1 << 2)  # COPYFILE_XATTR
+    else:
+        # Unlike copystat's best-effort xattr copying, propagate failures:
+        # a move must not delete its source if metadata could not be saved.
+        if hasattr(os, "listxattr"):
+            names = os.listxattr(src, follow_symlinks=False)
+            for name in os.listxattr(dst, follow_symlinks=False):
+                if name not in names:
+                    os.removexattr(dst, name, follow_symlinks=False)
+            for name in names:
+                value = os.getxattr(src, name, follow_symlinks=False)
+                os.setxattr(dst, name, value, follow_symlinks=False)
+    apply_local_metadata(dst, metadata)
+    if copy_flags and sys.platform == "darwin":
+        copy_macos_metadata(src, dst, 1 << 0)  # COPYFILE_ACL
+    if copy_flags and hasattr(source, "st_flags") and hasattr(os, "chflags"):
+        os.chflags(dst, source.st_flags, follow_symlinks=False)
+
+
 class VFS(ABC):
     label: str = ""
 
@@ -318,8 +415,51 @@ class VFS(ABC):
     @abstractmethod
     def leave(self) -> None: ...
 
+    def get_metadata(self, path: str) -> FileMetadata:
+        parent, _, name = path.rstrip("/").rpartition("/")
+        for item in self.read_dir(parent):
+            if item.name == name:
+                return FileMetadata(
+                    mode=item.mode,
+                    mtime_ns=(
+                        int(item.mod_time * 1_000_000_000)
+                        if item.mod_time
+                        else None
+                    ),
+                    link_target=item.link_target if item.is_symlink() else None,
+                )
+        return FileMetadata()
+
+    def set_metadata(self, path: str, metadata: FileMetadata) -> None:
+        if metadata != FileMetadata():
+            raise OSError(
+                f"{self.label or type(self).__name__} cannot preserve file "
+                "attributes; contents copied without attributes. "
+                "Use a TAR archive to transfer attributes."
+            )
+
+    def write_symlink(self, path: str, target: str) -> None:
+        raise OSError(
+            f"{self.label or type(self).__name__} cannot store symlinks"
+        )
+
+    def local_path(self, path: str) -> str | None:
+        return None
+
 
 class LocalFS(VFS):
+    def local_path(self, path: str) -> str:
+        return path
+
+    def get_metadata(self, path: str) -> FileMetadata:
+        return local_metadata(path)
+
+    def set_metadata(self, path: str, metadata: FileMetadata) -> None:
+        apply_local_metadata(path, metadata)
+
+    def write_symlink(self, path: str, target: str) -> None:
+        os.symlink(target, path)
+
     def probe(self, header: bytes, filename: str) -> bool:
         return os.path.isdir(filename)
 
@@ -350,6 +490,7 @@ class LocalFS(VFS):
                 file_type=ft,
                 mod_time=info.st_mtime,
                 executable=executable,
+                mode=stat.S_IMODE(info.st_mode),
             )
             if is_symlink:
                 try:
@@ -382,6 +523,7 @@ class TarFS(VFS):
         self.tar_mode: str = "r:"
         self.tf: tarfile.TarFile | None = None
         self._members: dict[str, tarfile.TarInfo] = {}
+        self._batch_data: dict[str, io.BytesIO] = {}
 
     def probe(self, header: bytes, filename: str) -> bool:
         lower = filename.lower()
@@ -432,6 +574,9 @@ class TarFS(VFS):
             name = os.path.normpath(member.name)
             if name in (".", ""):
                 continue
+            if os.path.isabs(name) or name == ".." or name.startswith("../"):
+                tf.close()
+                raise OSError(f"unsafe archive path: {member.name}")
             d = os.path.dirname(name)
             if d == ".":
                 d = ""
@@ -443,12 +588,13 @@ class TarFS(VFS):
             elif member.issym():
                 ft = FILE_TYPE_SYMLINK
 
+            members[name] = member
+            if member.isdir():
+                dirs.setdefault(name, [])
             key = d + "\x00" + base
             if key in seen:
                 continue
             seen.add(key)
-            if not member.isdir():
-                members[name] = member
             ensure_dir_chain(d)
             dirs.setdefault(d, []).append(
                 VFile(
@@ -456,6 +602,9 @@ class TarFS(VFS):
                     size=member.size,
                     file_type=ft,
                     mod_time=member.mtime,
+                    mode=member.mode,
+                    executable=bool(member.mode & 0o111),
+                    link_target=member.linkname if member.issym() else "",
                 )
             )
 
@@ -477,6 +626,8 @@ class TarFS(VFS):
         return self.dirs[path]
 
     def read_file(self, path: str) -> io.IOBase:
+        if path in self._batch_data:
+            return io.BytesIO(self._batch_data[path].getvalue())
         if self.tf is not None and path in self._members:
             f = self.tf.extractfile(self._members[path])
             if f is None:
@@ -495,6 +646,23 @@ class TarFS(VFS):
         tf.close()
         return io.BytesIO(data)
 
+    def get_metadata(self, path: str) -> FileMetadata:
+        member = self._members.get(path)
+        if member is None:
+            return FileMetadata()  # An implicit archive directory.
+        if not (
+            member.isfile()
+            or member.isdir()
+            or member.issym()
+            or member.islnk()
+        ):
+            raise OSError(f"unsupported archive entry: {path}")
+        return FileMetadata(
+            mode=member.mode,
+            mtime_ns=int(member.mtime * 1_000_000_000),
+            link_target=member.linkname if member.issym() else None,
+        )
+
     def read_files(self, paths: set[str]) -> dict[str, io.BytesIO]:
         """Extract multiple files in one sequential pass (no repeated decompression)."""
         result: dict[str, io.BytesIO] = {}
@@ -505,7 +673,7 @@ class TarFS(VFS):
                 if not remaining:
                     break
                 name = os.path.normpath(member.name)
-                if name in remaining:
+                if name in remaining and member.isfile():
                     f = tf.extractfile(member)
                     if f is not None:
                         result[name] = io.BytesIO(f.read())
@@ -524,6 +692,7 @@ class TarFS(VFS):
             self.tf.close()
             self.tf = None
         self._members = {}
+        self._batch_data = {}
         self.dirs = None
         self.archive_path = ""
 
@@ -534,6 +703,7 @@ class ZipFS(VFS):
     def __init__(self) -> None:
         self.dirs: dict[str, list[VFile]] | None = None
         self.archive_path: str = ""
+        self._infos: dict[str, zipfile.ZipInfo] = {}
 
     def probe(self, header: bytes, filename: str) -> bool:
         return filename.lower().endswith(".zip")
@@ -563,6 +733,9 @@ class ZipFS(VFS):
             name = os.path.normpath(info.filename)
             if name in (".", ""):
                 continue
+            if os.path.isabs(name) or name == ".." or name.startswith("../"):
+                zf.close()
+                raise OSError(f"unsafe archive path: {info.filename}")
             d = os.path.dirname(name)
             if d == ".":
                 d = ""
@@ -572,6 +745,13 @@ class ZipFS(VFS):
 
             is_dir = info.filename.endswith("/")
             ft = FILE_TYPE_DIR if is_dir else FILE_TYPE_FILE
+            unix_mode = (
+                info.external_attr >> 16 if info.create_system == 3 else 0
+            )
+            if stat.S_ISLNK(unix_mode):
+                ft = FILE_TYPE_SYMLINK
+            if is_dir:
+                dirs.setdefault(name, [])
 
             key = d + "\x00" + base
             if key in seen:
@@ -593,15 +773,26 @@ class ZipFS(VFS):
                     size=info.file_size,
                     file_type=ft,
                     mod_time=mod_time,
+                    mode=stat.S_IMODE(unix_mode) if unix_mode else None,
+                    executable=bool(unix_mode & 0o111),
+                    link_target=(
+                        os.fsdecode(zf.read(info))
+                        if ft == FILE_TYPE_SYMLINK
+                        else ""
+                    ),
                 )
             )
 
+        infos = {
+            os.path.normpath(info.filename): info for info in zf.infolist()
+        }
         zf.close()
         for d in dirs:
             dirs[d] = sort_files(dirs[d])
         new_fs = ZipFS()
         new_fs.dirs = dirs
         new_fs.archive_path = filename
+        new_fs._infos = infos
         return new_fs
 
     def read_dir(self, path: str) -> list[VFile]:
@@ -613,9 +804,28 @@ class ZipFS(VFS):
 
     def read_file(self, path: str) -> io.IOBase:
         zf = zipfile.ZipFile(self.archive_path, "r")
-        data = zf.read(path)
+        data = zf.read(self._infos.get(path, path))
         zf.close()
         return io.BytesIO(data)
+
+    def get_metadata(self, path: str) -> FileMetadata:
+        info = self._infos.get(path)
+        if info is None:
+            return FileMetadata()
+        unix_mode = info.external_attr >> 16 if info.create_system == 3 else 0
+        try:
+            mtime = int(datetime(*info.date_time).timestamp() * 1_000_000_000)
+        except (ValueError, OSError):
+            mtime = None
+        return FileMetadata(
+            mode=stat.S_IMODE(unix_mode) if unix_mode else None,
+            mtime_ns=mtime,
+            link_target=(
+                os.fsdecode(self.read_file(path).read())
+                if stat.S_ISLNK(unix_mode)
+                else None
+            ),
+        )
 
     def write_file(self, path: str, data: io.IOBase) -> None:
         raise OSError("writing to zip archives not supported")
@@ -626,6 +836,7 @@ class ZipFS(VFS):
     def leave(self) -> None:
         self.dirs = None
         self.archive_path = ""
+        self._infos = {}
 
 
 class CompressedFS(VFS):
@@ -647,6 +858,7 @@ class CompressedFS(VFS):
         self.inner_mtime: float = 0.0
         self.archive_path: str = ""
         self.ext: str = ""
+        self.inner_mode: int | None = None
 
     def probe(self, header: bytes, filename: str) -> bool:
         lower = filename.lower()
@@ -672,6 +884,7 @@ class CompressedFS(VFS):
         # Read to get the decompressed size and mtime
         with opener(filename, "rb") as f:
             data = f.read()
+            stored_mtime = getattr(f, "mtime", None)
 
         try:
             file_mtime = os.path.getmtime(filename)
@@ -683,6 +896,9 @@ class CompressedFS(VFS):
         new_fs.inner_name = inner_name
         new_fs.inner_size = len(data)
         new_fs.inner_mtime = file_mtime
+        if stored_mtime is not None:
+            new_fs.inner_mtime = stored_mtime
+        new_fs.inner_mode = stat.S_IMODE(os.stat(filename).st_mode)
         new_fs.archive_path = filename
         new_fs.ext = ext
         return new_fs
@@ -696,6 +912,7 @@ class CompressedFS(VFS):
                 size=self.inner_size,
                 file_type=FILE_TYPE_FILE,
                 mod_time=self.inner_mtime,
+                mode=self.inner_mode,
             )
         ]
 
@@ -1306,8 +1523,18 @@ def _parse_ls_line(line: str) -> VFile | None:
         if " -> " in name_field:
             name_field, link_target = name_field.split(" -> ", 1)
 
-    if file_type == FILE_TYPE_FILE and "x" in perms[1:]:
-        executable = True
+    mode = 0
+    for index, char in enumerate(perms[1:10]):
+        if char in "rwxst":
+            mode |= 1 << (8 - index)
+    if len(perms) >= 10:
+        if perms[3] in "sS":
+            mode |= stat.S_ISUID
+        if perms[6] in "sS":
+            mode |= stat.S_ISGID
+        if perms[9] in "tT":
+            mode |= stat.S_ISVTX
+    executable = file_type == FILE_TYPE_FILE and bool(mode & 0o111)
 
     months = {
         "Jan": 1,
@@ -1344,6 +1571,7 @@ def _parse_ls_line(line: str) -> VFile | None:
         mod_time=mod_time,
         executable=executable,
         link_target=link_target,
+        mode=mode,
     )
 
 
@@ -1351,6 +1579,45 @@ class SSHFS(VFS):
     """SSH virtual filesystem using the ``ssh`` executable."""
 
     label = "SSH"
+
+    def get_metadata(self, path: str) -> FileMetadata:
+        # ls output rounds timestamps and loses special permission bits.
+        # Use lstat so links are copied as links, including dangling ones.
+        script = (
+            "import json, os, stat, sys; p=sys.argv[1]; s=os.lstat(p); "
+            "assert stat.S_ISREG(s.st_mode) or stat.S_ISDIR(s.st_mode) or stat.S_ISLNK(s.st_mode), 'unsupported special file'; "
+            "print(json.dumps(dict(mode=stat.S_IMODE(s.st_mode), "
+            "atime_ns=s.st_atime_ns, mtime_ns=s.st_mtime_ns, "
+            "link_target=os.readlink(p) if stat.S_ISLNK(s.st_mode) else None)))"
+        )
+        result = self._run(
+            f"python3 -c {shlex.quote(script)} {shlex.quote(path)}"
+        )
+        return FileMetadata(**json.loads(result))
+
+    def set_metadata(self, path: str, metadata: FileMetadata) -> None:
+        script = (
+            "import json, os, sys; p=sys.argv[1]; m=json.loads(sys.argv[2]); "
+            "link=os.path.islink(p)\n"
+            "if m['mode'] is not None and (not link or os.chmod in os.supports_follow_symlinks): os.chmod(p,m['mode'],follow_symlinks=False)\n"
+            "if m['mtime_ns'] is not None:\n"
+            " a=m['atime_ns'] if m['atime_ns'] is not None else m['mtime_ns']\n"
+            " os.utime(p, ns=(a,m['mtime_ns']), follow_symlinks=False)\n"
+        )
+        payload = json.dumps(vars(metadata))
+        self._run(
+            f"python3 -c {shlex.quote(script)} {shlex.quote(path)} {shlex.quote(payload)}"
+        )
+
+    def write_symlink(self, path: str, target: str) -> None:
+        script = (
+            "import os, sys; p=sys.argv[1]; "
+            "os.unlink(p) if os.path.lexists(p) else None; "
+            "os.symlink(sys.argv[2],p)"
+        )
+        self._run(
+            f"python3 -c {shlex.quote(script)} {shlex.quote(path)} {shlex.quote(target)}"
+        )
 
     def __init__(self) -> None:
         self.host = ""
@@ -1478,8 +1745,23 @@ class SSHFS(VFS):
         content = data.read()
         if isinstance(content, str):
             content = content.encode()
-        q = path.replace("'", "'\\''")
-        self._run_bytes(f"cat > '{q}'", stdin=content)
+        script = (
+            "import os, shutil, stat, sys, tempfile\n"
+            "p=sys.argv[1]\n"
+            "if os.path.exists(p) and not os.path.islink(p):\n"
+            " with open(p,'wb') as out: shutil.copyfileobj(sys.stdin.buffer,out)\n"
+            " sys.exit(0)\n"
+            "fd,tmp=tempfile.mkstemp(prefix='.xc-copy-',dir=os.path.dirname(os.path.abspath(p)))\n"
+            "try:\n"
+            " with os.fdopen(fd,'wb') as out: shutil.copyfileobj(sys.stdin.buffer,out)\n"
+            " os.replace(tmp,p)\n"
+            "finally:\n"
+            " if os.path.lexists(tmp): os.unlink(tmp)\n"
+        )
+        self._run_bytes(
+            f"python3 -c {shlex.quote(script)} {shlex.quote(path)}",
+            stdin=content,
+        )
 
     def mkdir_all(self, path: str) -> None:
         q = path.replace("'", "'\\''")
@@ -1508,6 +1790,12 @@ class SSHFS(VFS):
 
 class GrepFS(VFS):
     label = "GREP"
+
+    def local_path(self, path: str) -> str:
+        return os.path.join(self.base_dir, path)
+
+    def get_metadata(self, path: str) -> FileMetadata:
+        return local_metadata(self.local_path(path))
 
     def __init__(self) -> None:
         self.results: list[VFile] = []
@@ -2954,6 +3242,8 @@ class App:
         self.op_cancelled = False
         self.overwrite_all = False
         self._ow_dir_cache = {}
+        self._moving = is_move
+        self._native_moved: set[str] = set()
         if names is not None:
             copied = self._copy_tagged(names, dest)
             # Only delete sources that were fully copied (nothing
@@ -2962,12 +3252,19 @@ class App:
                 for name in copied:
                     if self.op_cancelled:
                         break
-                    self.do_delete(name)
+                    if name not in self._native_moved:
+                        self.do_delete(name)
         else:
             ok = self.do_copy(src or "", dest)
-            if is_move and ok and not self.op_cancelled:
+            if (
+                is_move
+                and ok
+                and not self.op_cancelled
+                and src not in self._native_moved
+            ):
                 self.do_delete(src or "")
         self.finish_op()
+        self._moving = False
 
     def do_copy(self, src: str, dest: str) -> bool:
         """Copy src to dest; returns True if fully copied (safe for a
@@ -2979,7 +3276,51 @@ class App:
             dest += os.path.basename(src)
         elif isinstance(dst_panel.fs, LocalFS) and os.path.isdir(dest):
             dest = os.path.join(dest, os.path.basename(src))
-        is_dir = False
+        if isinstance(src_panel.fs, LocalFS) and isinstance(
+            dst_panel.fs, LocalFS
+        ):
+            try:
+                if same_local_entry(src_path, dest):
+                    raise OSError("source and destination are the same file")
+                if os.path.isdir(src_path) and not os.path.islink(src_path):
+                    source_real = os.path.realpath(src_path)
+                    if (
+                        os.path.commonpath(
+                            [source_real, os.path.realpath(dest)]
+                        )
+                        == source_real
+                    ):
+                        raise OSError("cannot copy a directory into itself")
+                if getattr(self, "_moving", False):
+                    # Keep directory-merge semantics when the target exists.
+                    merge = os.path.isdir(src_path) and os.path.isdir(dest)
+                    if not merge:
+                        if self.progress(
+                            "Moving " + os.path.basename(src_path)
+                        ):
+                            return False
+                        if not self._confirm_overwrite(
+                            src_panel.fs, src_path, dst_panel.fs, dest
+                        ):
+                            return False
+                        try:
+                            os.rename(src_path, dest)
+                        except OSError as e:
+                            if e.errno != errno.EXDEV:
+                                raise
+                        else:
+                            self._native_moved.add(src)
+                            self.panels[0].reload()
+                            self.panels[1].reload()
+                            return True
+            except Exception as e:
+                self.set_error(str(e))
+                return False
+        is_dir = (
+            os.path.isdir(src_path) and not os.path.islink(src_path)
+            if isinstance(src_panel.fs, LocalFS)
+            else False
+        )
         for f in src_panel.files:
             if f.name == src:
                 is_dir = f.is_dir()
@@ -2988,6 +3329,17 @@ class App:
             ok = self._copy_dir(src_panel.fs, src_path, dst_panel.fs, dest)
         else:
             ok = self._copy_file(src_panel.fs, src_path, dst_panel.fs, dest)
+        if (
+            ok
+            and getattr(self, "_moving", False)
+            and isinstance(src_panel.fs, LocalFS)
+            and not isinstance(dst_panel.fs, LocalFS)
+        ):
+            self.set_error(
+                "Contents copied; source retained because this destination "
+                "cannot preserve all native metadata. Use a TAR archive."
+            )
+            ok = False
         self.panels[0].reload()
         self.panels[1].reload()
         return ok
@@ -3004,19 +3356,55 @@ class App:
         if not self._confirm_overwrite(src_fs, src_path, dst_fs, dst_path):
             return False
         log.info("copy file from=%s to=%s", src_path, dst_path)
+        staging = None
         try:
-            inp = src_fs.read_file(src_path)
-        except Exception as e:
-            self.set_error(str(e))
-            return False
-        try:
-            dst_fs.write_file(dst_path, inp)
+            metadata = src_fs.get_metadata(src_path)
+            local_src = src_fs.local_path(src_path)
+            if local_src is not None and isinstance(dst_fs, LocalFS):
+                if same_local_entry(local_src, dst_path):
+                    raise OSError("source and destination are the same file")
+            target = dst_path
+            if isinstance(dst_fs, LocalFS):
+                fd, staging = tempfile.mkstemp(
+                    prefix=".xc-copy-",
+                    dir=os.path.dirname(os.path.abspath(dst_path)),
+                )
+                os.close(fd)
+                target = staging
+            if metadata.link_target is not None:
+                if staging is not None:
+                    os.unlink(staging)
+                dst_fs.write_symlink(target, metadata.link_target)
+            else:
+                with src_fs.read_file(src_path) as inp:
+                    dst_fs.write_file(target, inp)
+            if local_src is not None and isinstance(dst_fs, LocalFS):
+                copy_local_metadata(
+                    local_src, target, metadata, copy_flags=False
+                )
+            else:
+                dst_fs.set_metadata(target, metadata)
+            if staging is not None:
+                os.replace(staging, dst_path)
+                staging = None
+                # Restrictive ACLs and flags can prevent renaming staging.
+                if local_src is not None and sys.platform == "darwin":
+                    copy_macos_metadata(local_src, dst_path, 1 << 0)
+                if local_src is not None and hasattr(os, "chflags"):
+                    os.chflags(
+                        dst_path,
+                        os.lstat(local_src).st_flags,
+                        follow_symlinks=False,
+                    )
         except Exception as e:
             self.set_error(str(e))
             return False
         finally:
-            if hasattr(inp, "close"):
-                inp.close()
+            if staging is not None and os.path.lexists(staging):
+                try:
+                    os.unlink(staging)
+                except OSError as e:
+                    self.set_error(f"copy cleanup failed for {staging}: {e}")
         return True
 
     def _copy_dir(
@@ -3030,7 +3418,15 @@ class App:
             return False
         log.info("copy dir from=%s to=%s", src_path, dst_path)
         try:
-            dst_fs.mkdir_all(dst_path)
+            metadata = src_fs.get_metadata(src_path)
+            if isinstance(dst_fs, LocalFS) and os.path.islink(dst_path):
+                raise OSError(
+                    f"cannot copy a directory over a symlink: {dst_path}"
+                )
+            if isinstance(dst_fs, LocalFS):
+                os.makedirs(dst_path, mode=0o700, exist_ok=True)
+            else:
+                dst_fs.mkdir_all(dst_path)
         except Exception as e:
             self.set_error(str(e))
             return False
@@ -3049,6 +3445,15 @@ class App:
                 ok &= self._copy_dir(src_fs, child_src, dst_fs, child_dst)
             else:
                 ok &= self._copy_file(src_fs, child_src, dst_fs, child_dst)
+        try:
+            local_src = src_fs.local_path(src_path)
+            if local_src is not None and isinstance(dst_fs, LocalFS):
+                copy_local_metadata(local_src, dst_path, metadata)
+            else:
+                dst_fs.set_metadata(dst_path, metadata)
+        except Exception as e:
+            self.set_error(str(e))
+            ok = False
         return ok
 
     def _copy_tagged(self, names: list[str], dest: str) -> list[str]:
@@ -3057,127 +3462,34 @@ class App:
         src_panel = self.panels[self.active]
         dst_panel = self.panels[1 - self.active]
         src_fs = src_panel.fs
-        # Batch optimisation for TarFS: single-pass extraction avoids
-        # decompressing a large .tar.gz once per file.
+        # Prefetch regular TAR members in one pass, but use the same copy
+        # and metadata path as individual files (including links/directories).
         if isinstance(src_fs, TarFS) and len(names) > 1:
-            file_lookup = {f.name: f for f in src_panel.files}
-            file_names: list[str] = []
-            dir_names: list[str] = []
+            paths = set()
             for name in names:
-                fi = file_lookup.get(name)
-                if fi and fi.is_dir():
-                    dir_names.append(name)
-                else:
-                    file_names.append(name)
-            # Collect all tar paths for flat files and dir descendants.
-            # owners/dir_owners track which tagged name each entry
-            # belongs to, so failures mark the whole name as not copied.
-            tar_to_dest: list[tuple[str, str]] = []
-            owners: list[str] = []
-            dirs_to_create: list[str] = []
-            dir_owners: list[str] = []
-            for name in file_names:
-                tp = vfs_join(src_fs, src_panel.path, name)
-                d = dest
-                if d.endswith("/"):
-                    d += name
-                elif isinstance(dst_panel.fs, LocalFS) and os.path.isdir(d):
-                    d = os.path.join(d, name)
-                tar_to_dest.append((tp, d))
-                owners.append(name)
-            for name in dir_names:
-                tp = vfs_join(src_fs, src_panel.path, name)
-                d = dest
-                if d.endswith("/"):
-                    d += name
-                elif isinstance(dst_panel.fs, LocalFS) and os.path.isdir(d):
-                    d = os.path.join(d, name)
-                n_files = len(tar_to_dest)
-                n_dirs = len(dirs_to_create)
-                self._collect_tar_tree(
-                    src_fs, tp, d, dst_panel.fs, tar_to_dest, dirs_to_create
+                prefix = vfs_join(src_fs, src_panel.path, name)
+                paths.update(
+                    path
+                    for path, member in src_fs._members.items()
+                    if member.isfile()
+                    and (path == prefix or path.startswith(prefix + "/"))
                 )
-                owners += [name] * (len(tar_to_dest) - n_files)
-                dir_owners += [name] * (len(dirs_to_create) - n_dirs)
-            failed: set[str] = set()
-            for dp, owner in zip(dirs_to_create, dir_owners):
-                try:
-                    dst_panel.fs.mkdir_all(dp)
-                except Exception as e:
-                    self.set_error(str(e))
-                    failed.add(owner)
-            # Ask all overwrite questions up front so skipped files are
-            # not extracted at all.
-            skipped: set[int] = set()
-            for i, ((tp, dp), owner) in enumerate(zip(tar_to_dest, owners)):
-                if self.op_cancelled:
-                    return []
-                if not self._confirm_overwrite(src_fs, tp, dst_panel.fs, dp):
-                    skipped.add(i)
-                    failed.add(owner)
-            if self.op_cancelled:
+            try:
+                src_fs._batch_data = src_fs.read_files(paths)
+            except Exception as e:
+                self.set_error(str(e))
                 return []
-            tar_paths = {
-                tp for i, (tp, _) in enumerate(tar_to_dest) if i not in skipped
-            }
-            extracted = src_fs.read_files(tar_paths)
-            for i, ((tp, dp), owner) in enumerate(zip(tar_to_dest, owners)):
-                if i in skipped:
-                    continue
-                if self.progress("Copying " + os.path.basename(tp)):
-                    break
-                if tp in extracted:
-                    log.info("copy file from=%s to=%s", tp, dp)
-                    try:
-                        dst_panel.fs.write_file(dp, extracted[tp])
-                    except Exception as e:
-                        self.set_error(str(e))
-                        failed.add(owner)
-                    dst_panel.reload()
-                    self.draw()
-                    self.scr.refresh()
-                else:
-                    failed.add(owner)
-            self.panels[0].reload()
-            self.panels[1].reload()
-            return [n for n in names if n not in failed]
-        else:
-            copied: list[str] = []
+        copied: list[str] = []
+        try:
             for name in names:
                 if self.op_cancelled:
                     break
                 if self.do_copy(name, dest):
                     copied.append(name)
             return copied
-
-    def _collect_tar_tree(
-        self,
-        src_fs: TarFS,
-        src_path: str,
-        dst_path: str,
-        dst_fs: VFS,
-        tar_to_dest: list[tuple[str, str]],
-        dirs_to_create: list[str],
-    ) -> None:
-        dirs_to_create.append(dst_path)
-        try:
-            files = src_fs.read_dir(src_path)
-        except OSError:
-            return
-        for f in files:
-            child_src = src_path + "/" + f.name
-            child_dst = vfs_join(dst_fs, dst_path, f.name)
-            if f.is_dir():
-                self._collect_tar_tree(
-                    src_fs,
-                    child_src,
-                    child_dst,
-                    dst_fs,
-                    tar_to_dest,
-                    dirs_to_create,
-                )
-            else:
-                tar_to_dest.append((child_src, child_dst))
+        finally:
+            if isinstance(src_fs, TarFS):
+                src_fs._batch_data = {}
 
     def do_delete(self, name: str) -> None:
         p = self.panels[self.active]
@@ -3185,11 +3497,13 @@ class App:
         if not dp:
             self.set_error("delete not supported in virtual FS")
             return
+        if not os.path.lexists(dp):
+            return  # A native move already removed this directory entry.
         if self.progress("Deleting " + name):
             return
         log.info("delete path=%s", dp)
         try:
-            if os.path.isdir(dp):
+            if os.path.isdir(dp) and not os.path.islink(dp):
                 shutil.rmtree(dp)
             else:
                 os.remove(dp)
@@ -3410,17 +3724,19 @@ class App:
         remote_path = p.vfs_path(f.name)
         _, ext = os.path.splitext(f.name)
         try:
-            data = p.fs.read_file(remote_path)
-            content = data.read()
+            metadata = p.fs.get_metadata(remote_path)
+            with p.fs.read_file(remote_path) as data:
+                content = data.read()
         except Exception as e:
             self.set_error(f"download: {e}")
             return
 
         tmp_fd, tmp_path = tempfile.mkstemp(suffix=ext, prefix="xc-")
         try:
-            os.write(tmp_fd, content)
-            os.close(tmp_fd)
-            mtime_before = os.path.getmtime(tmp_path)
+            with os.fdopen(tmp_fd, "wb") as output:
+                output.write(content)
+            apply_local_metadata(tmp_path, metadata)
+            before = os.stat(tmp_path)
 
             # expand macros with tmp_path standing in for %F
             expanded, background = self._expand_macro_with_path(cmd, tmp_path)
@@ -3437,10 +3753,19 @@ class App:
             curses.raw()
 
             if rc == 0:
-                mtime_after = os.path.getmtime(tmp_path)
-                if mtime_after != mtime_before:
+                after = os.stat(tmp_path)
+                content_changed = (after.st_mtime_ns, after.st_size) != (
+                    before.st_mtime_ns,
+                    before.st_size,
+                )
+                mode_changed = after.st_mode != before.st_mode
+                if content_changed:
                     with open(tmp_path, "rb") as fh:
                         p.fs.write_file(remote_path, fh)
+                if (content_changed or mode_changed) and isinstance(
+                    p.fs, SSHFS
+                ):
+                    p.fs.set_metadata(remote_path, local_metadata(tmp_path))
             else:
                 self.set_error(f"error: exit code = {rc}")
         except Exception as e:

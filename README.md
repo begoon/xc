@@ -131,6 +131,34 @@ Press `x` to open the **command** menu:
 
 Copy and move operations use the inactive panel's current path as the default destination. A prompt lets you edit the destination before confirming.
 
+Local copies preserve permission bits (including executable and read-only modes),
+access/modification times, ownership, symlinks, and supported native metadata.
+On macOS this includes ACLs, extended attributes/resource forks, and file flags;
+on Linux it includes extended attributes and POSIX ACLs exposed through them.
+Directory attributes are restored after copying their contents. Overwriting a
+file uses the source's attributes. A permission or metadata error is reported
+and prevents a move from deleting its source.
+
+Local moves use a filesystem rename when possible, preserving the original
+inode and its attributes. Cross-filesystem moves and directory merges use the
+metadata-preserving copy path, then delete only fully copied sources.
+
+TAR and Unix ZIP extraction preserves stored modes, modification times, and
+symbolic links, for both individual and tagged entries. Archive ownership,
+ACLs, and extended attributes are not restored. Plain compressed files inherit
+the compressed file's permissions; gzip uses its stored timestamp when present.
+
+SSH transfers preserve modes, access/modification times, and symlinks, and
+require `python3` on the remote host. Remote editing also preserves executable
+permissions in the temporary copy and uploads mode changes. SSH does not transfer
+native ownership, ACLs, or extended attributes between hosts. Cloud object/Drive
+backends transfer contents but cannot restore POSIX attributes; xc reports this
+limitation. Moves to non-local backends retain the local source to avoid losing
+metadata. Transfer a TAR archive when these attributes need to travel together.
+
+Copying creates new files: hard-link relationships and creation/change times are
+not preserved by the copy path. Native moves preserve hard-link relationships.
+
 ### Overwrite confirmation
 
 If a copy, move, or rename target already exists, a confirmation dialog appears showing the size and modification time of both the new and the existing file (directories are shown as `<DIR>`):

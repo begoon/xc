@@ -1,3 +1,5 @@
+set dotenv-load
+
 default: install
 
 run:
@@ -73,9 +75,12 @@ push:
     import subprocess
     subprocess.run(["git", "push"], check=True)
 
-publish token:
+publish $token=env("PYPI_TOKEN", ""):
     #!/usr/bin/env python3
-    import sys, json, urllib.request
+    import os, sys, json, urllib.request
+    token = os.environ["token"]
+    if not token:
+        sys.exit("provide a token: just publish TOKEN, or set PYPI_TOKEN in the environment or .env")
     sys.path.insert(0, ".")
     from xc import VERSION, _parse_version
 
@@ -94,5 +99,5 @@ publish token:
     import subprocess, shutil
     shutil.rmtree("dist", ignore_errors=True)
     subprocess.run(["uv", "build"], check=True)
-    subprocess.run(["uv", "publish", "--token", "{{ token }}"], check=True)
+    subprocess.run(["uv", "publish", "--token", token], check=True)
     print(f"published {lv}")
