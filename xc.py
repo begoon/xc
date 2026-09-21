@@ -37,10 +37,10 @@ import tty
 import urllib.request
 import zipfile
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
 
 VERSION = "0.2.34"
 
