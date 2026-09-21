@@ -42,7 +42,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-VERSION = "0.2.33"
+VERSION = "0.2.34"
 
 # ---------------------------------------------------------------------------
 # Logging

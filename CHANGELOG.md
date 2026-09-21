@@ -6,6 +6,43 @@ and this project loosely follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.34] - 2026-09-21
+
+### Fixed
+
+- Advance the version so installations of the older GitHub code labelled
+  `0.2.33` can self-update to the file metadata fixes.
+- Record the current PyPI releases and associate this release with the
+  `v0.2.34` Git tag.
+
+## [0.2.33] - 2026-09-21
+
+This is the PyPI publication date. GitHub code had already used `0.2.33`
+since June 2, before the metadata fixes were added. The published wheel
+and source archive match `xc.py` at commit `e8e84c9`.
+
+### Fixed
+
+- Preserve local file permissions, timestamps, ownership, symlinks, and
+  supported native metadata during copying. Use native renames for local
+  moves when possible; retain move sources if metadata preservation fails.
+- Restore stored modes, timestamps, and symlinks during TAR/ZIP extraction,
+  including tagged extraction, and preserve modes and timestamps over SSH.
+- Preserve executable permissions in remote-command temporary files and
+  upload SSH mode changes. Document backend metadata limitations.
+
+### Added
+
+- Regression tests for metadata preservation and move safety.
+- Optional `.env` loading and a `PYPI_TOKEN` default for `just publish`.
+
+### Changed
+
+- Earlier GitHub changes included overwrite confirmation for copy, move,
+  and rename; command-line panel directories; modal input dialogs with
+  history; cancellable group operations; and navigation out of unreadable
+  directories. These changes were not previously recorded here.
+
 ## [0.2.26] - 2026-04-24
 
 ### Changed
@@ -111,6 +148,8 @@ accurately.
 - Install script issues.
 - Miscellaneous small fixes.
 
-[Unreleased]: https://github.com/begoon/xc/compare/v0.2.21...HEAD
+[Unreleased]: https://github.com/begoon/xc/compare/v0.2.34...HEAD
+[0.2.34]: https://github.com/begoon/xc/compare/e8e84c9...v0.2.34
+[0.2.33]: https://github.com/begoon/xc/tree/e8e84c9
 [0.2.21]: https://github.com/begoon/xc/compare/v0.2.20...v0.2.21
 [0.2.20]: https://github.com/begoon/xc/releases/tag/v0.2.20
