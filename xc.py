@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "0.2.35"
+VERSION = "0.2.36"
 
 # ---------------------------------------------------------------------------
 # Logging

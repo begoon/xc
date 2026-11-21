@@ -6,6 +6,15 @@ and this project loosely follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.36] - 2026-11-21
+
+### Changed
+
+- The shell installer looks for `~/bin` first, then `~/.local/bin`. If neither
+  directory exists, it saves `~/xc` and prints Bash setup instructions.
+- Refresh the README screenshot and resolve the PyPI token through 1Password
+  when running `just publish`.
+
 ## [0.2.35] - 2026-11-21
 
 ### Changed
@@ -156,7 +165,8 @@ accurately.
 - Install script issues.
 - Miscellaneous small fixes.
 
-[Unreleased]: https://github.com/begoon/xc/compare/v0.2.35...HEAD
+[Unreleased]: https://github.com/begoon/xc/compare/v0.2.36...HEAD
+[0.2.36]: https://github.com/begoon/xc/compare/v0.2.35...v0.2.36
 [0.2.35]: https://github.com/begoon/xc/compare/v0.2.34...v0.2.35
 [0.2.34]: https://github.com/begoon/xc/compare/e8e84c9...v0.2.34
 [0.2.33]: https://github.com/begoon/xc/tree/e8e84c9
