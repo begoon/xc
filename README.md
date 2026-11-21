@@ -72,7 +72,7 @@ xc [folder1 [folder2]]
 | `folder2` | Directory to open in the other (inactive) panel  |
 | `-u`      | Self-update from GitHub and exit                 |
 
-Paths may be relative and may use `~`. With no arguments, the active panel opens in the current working directory and the inactive panel restores the path from the previous session.
+With no arguments, `xc` restores both panel directories and remembers which panel was active. Use `xc .` or `xc folder1` to override just the active panel. With `xc f1 f2`, the active panel opens `f1` and the other panel opens `f2`. Paths may be relative and may use `~`.
 
 ### Development
 
@@ -94,7 +94,7 @@ This fetches the latest `xc.py` from the repository, compares versions, and repl
 
 xc shows two file panels side by side. One panel is **active** (highlighted border), the other is **inactive**. You navigate files in the active panel and use the inactive panel as a target for file operations like copy and move. Press `Tab` to switch the active panel. Press `h` / `l` to activate the left / right panel directly.
 
-On startup the active panel opens in the current working directory (or `folder1` if given on the command line). The inactive panel restores the path from the previous session (or opens `folder2`).
+On first launch, the active panel opens in the current working directory and the other panel opens in your home directory. These defaults also apply when a panel’s saved directory is missing.
 
 ### Navigation
 

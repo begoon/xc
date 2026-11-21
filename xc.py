@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "0.2.34"
+VERSION = "0.2.35"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -5813,6 +5813,7 @@ class App:
                 key = ord(key)
             if key == 3:  # Ctrl-C
                 if self.ctrl_c_pending:
+                    self.do_save_state()
                     break
                 self.ctrl_c_pending = True
                 self.err_msg = "press Ctrl-C again to terminate"
@@ -5836,21 +5837,18 @@ def main(stdscr: curses.window, dirs: list[str]) -> None:
     cwd = os.getcwd() or home
 
     saved = load_state()
-    if saved and saved.active in (0, 1):
-        active = saved.active
-        inactive_dir = saved.panels[1 - active] or home
-    else:
-        active = 0
-        inactive_dir = home
-    active_dir = dirs[0] if dirs else cwd
+    active = saved.active if saved and saved.active in (0, 1) else 0
+    paths = [cwd, home] if active == 0 else [home, cwd]
+    if saved:
+        for side, path in enumerate(saved.panels[:2]):
+            if path and os.path.isdir(path):
+                paths[side] = path
+    if dirs:
+        paths[active] = dirs[0]
     if len(dirs) > 1:
-        inactive_dir = dirs[1]
-    if active == 0:
-        left_dir, right_dir = active_dir, inactive_dir
-    else:
-        left_dir, right_dir = inactive_dir, active_dir
+        paths[1 - active] = dirs[1]
 
-    app = App(stdscr, left_dir, right_dir, saved)
+    app = App(stdscr, paths[0], paths[1], saved)
 
     # Register menus
     app.add_menu(

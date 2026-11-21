@@ -6,6 +6,14 @@ and this project loosely follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.35] - 2026-11-21
+
+### Changed
+
+- Restore both panel directories and the active side on startup. Command-line
+  folders override the active panel first and the other panel second.
+- Save the session when quitting with a second Ctrl-C.
+
 ## [0.2.34] - 2026-09-21
 
 ### Fixed
@@ -148,7 +156,8 @@ accurately.
 - Install script issues.
 - Miscellaneous small fixes.
 
-[Unreleased]: https://github.com/begoon/xc/compare/v0.2.34...HEAD
+[Unreleased]: https://github.com/begoon/xc/compare/v0.2.35...HEAD
+[0.2.35]: https://github.com/begoon/xc/compare/v0.2.34...v0.2.35
 [0.2.34]: https://github.com/begoon/xc/compare/e8e84c9...v0.2.34
 [0.2.33]: https://github.com/begoon/xc/tree/e8e84c9
 [0.2.21]: https://github.com/begoon/xc/compare/v0.2.20...v0.2.21
