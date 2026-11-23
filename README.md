@@ -111,6 +111,7 @@ On first launch, the active panel opens in the current working directory and the
 | `Ctrl-D` / `Ctrl-U`  | Half-page down / up                    |
 | `Ctrl-L`             | Reload current directory               |
 | `Tab`                | Switch active panel                    |
+| `=`                  | Open active directory in other panel   |
 | `h` / `l`            | Activate left / right panel            |
 | `q`                  | Quit                                   |
 

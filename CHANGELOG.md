@@ -6,6 +6,14 @@ and this project loosely follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.37] - 2026-11-23
+
+### Added
+
+- `=` changes the inactive panel to the active panel's directory, leaving any
+  archive or remote VFS it was in. It works only when the active panel shows a
+  local directory.
+
 ## [0.2.36] - 2026-11-21
 
 ### Changed

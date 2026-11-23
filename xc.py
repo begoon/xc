@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "0.2.36"
+VERSION = "0.2.37"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -3671,6 +3671,21 @@ class App:
 
             self.show_prompt("chdir: ", self.panels[self.active].path, do_it)
 
+    def action_sync_panels(self) -> None:
+        """Change the inactive panel's directory to the active panel's."""
+        src = self.panels[self.active]
+        dst = self.panels[1 - self.active]
+        if src.stack or not isinstance(src.fs, LocalFS):
+            self.set_error("active panel is not a local directory")
+            return
+        while dst.stack:
+            dst.fs.leave()
+            dst.fs = dst.stack.pop().fs
+        dst.path = src.path
+        dst.cursor = 0
+        dst.offset = 0
+        dst.load_dir()
+
     def action_remotes(self) -> None:
         remotes_dir = os.path.join(os.path.expanduser("~"), ".xc", "remotes")
         if not os.path.isdir(remotes_dir):
@@ -4316,6 +4331,7 @@ class App:
                 "  Enter         enter directory / open file",
                 "  Backspace     go to parent directory",
                 "  Tab           switch panel",
+                "  =             other panel to this directory",
                 "  PgUp/PgDn     page up / page down",
                 "  Home/End      first / last file",
                 "  Space         tag file",
@@ -5932,6 +5948,7 @@ def main(stdscr: curses.window, dirs: list[str]) -> None:
     app.add_keymap("p", lambda: app.action_processes())
     app.add_keymap("o", lambda: app.action_path_viewer())
     app.add_keymap("k", lambda: app.action_env_viewer())
+    app.add_keymap("=", lambda: app.action_sync_panels())
 
     app.run()
 
