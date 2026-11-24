@@ -6,6 +6,8 @@ and this project loosely follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.41] - 2026-11-24
+
 ### Changed
 
 - Google Drive folders show their modified time, so folders with the same
