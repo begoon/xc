@@ -6,6 +6,8 @@ and this project loosely follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.40] - 2026-11-24
+
 ### Added
 
 - Google Docs, Sheets, Slides and Drawings are shown as `.docx`, `.xlsx`,
@@ -13,6 +15,14 @@ and this project loosely follows [Semantic Versioning](https://semver.org/).
   Forms and other types without an export format report a clear error, and
   native files cannot be overwritten by an upload.
 - Status-line errors are also written to `~/.xc/xc.log`.
+- `export=office|pdf|open|text` in a `.gdrive` file chooses the export
+  format for Google files, and `export.docs`, `export.sheets`,
+  `export.slides` and `export.drawings` override it per type (e.g.
+  `export.sheets=csv`).
+- `Enter` on `.docx`, `.xlsx`, `.pptx`, `.odt`, `.ods` and `.odp` files opens
+  them as zip archives (when they really are ZIP files).
+- Archives inside remote VFS (Google Drive, Dropbox, SSH, ...) can be entered:
+  xc works on a temporary copy that is deleted when leaving or exiting.
 
 ## [0.2.39] - 2026-11-24
 

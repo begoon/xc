@@ -33,7 +33,7 @@ Detection is probe-based: iterate `probes` list, first match wins. Add new VFS t
 ### GDriveFS
 
 - Google Drive VFS, config extension `.gdrive`
-- Config keys: `type=gdrive`, `folder` (start folder ID; `root` = My Drive; empty = virtual root), and either `key` (service account JSON path) or `client_id` + `client_secret` (OAuth "Desktop app" client), optional `account`
+- Config keys: `type=gdrive`, `folder` (start folder ID; `root` = My Drive; empty = virtual root), `export`/`export.<kind>` (export formats), and either `key` (service account JSON path) or `client_id` + `client_secret` (OAuth "Desktop app" client), optional `account`
 - Auth order: `key` → service account; else `client_id` → OAuth; else `google.auth.default()`
 - `client_secret` goes through `resolve_secret()`: `op://...` is resolved with `op read --no-newline` (only when a new login is needed), anything else is used as is
 - With `client_id`: `_gdrive_login` runs the OAuth2 loopback flow with PKCE (`http.server` on `127.0.0.1:0`, state check, 5 min timeout, Ctrl-C cancels), `access_type=online` (~1h token, no refresh token); token exchange/revoke via plain `urllib`
@@ -41,7 +41,7 @@ Detection is probe-based: iterate `probes` list, first match wins. Add new VFS t
 - Empty `folder` -> virtual root (`GItem.virtual`): `My Drive` (id `root`), `Shared with me` (`sharedWithMe = true` query), `Shared drives` (`drives().list()`, drive ID used as folder ID). Virtual root/`Shared with me`/`Shared drives` are read-only (`_check_writable`)
 - Paths resolve by listing each parent (`_item()` -> `_children()`), cached in `_listing` (dir path -> {display name -> `GItem`}); `read_dir` always refreshes, writes/mkdir drop the parent listing
 - Duplicate names in a listing get ` (2)`, ` (3)`... before the extension, ordered by (name, createdTime, id) so they are stable (`_gdrive_unique_name`); `/` in names becomes `_`
-- Google-native files (`application/vnd.google-apps.*`, `GItem.native`): `GDRIVE_EXPORTS` maps them to an extension + export MIME (Docs `.docx`, Sheets `.xlsx`, Slides `.pptx`, Drawings `.png`); `_display_name` appends the extension, `read_file` uses `export_media`, `write_file` refuses to overwrite them, types without an export raise
+- Google-native files (`application/vnd.google-apps.*`, `GItem.native`) are exported: `gdrive_exports(cfg)` builds `GDriveFS.exports` (Google MIME -> (extension, export MIME)) from `export=<preset>` (`GDRIVE_EXPORT_PRESETS`: office/pdf/open/text) plus `export.<docs|sheets|slides|drawings>=<ext>` overrides validated against `GDRIVE_EXPORT_KINDS`; Apps Script/Jamboard use fixed `GDRIVE_EXPORT_FIXED`. `_display_name` appends the extension, `read_file` uses `export_media`, `write_file` refuses to overwrite native files, types without an export raise
 - `App.set_error` logs every non-empty status message (`status error: ...`) to `~/.xc/xc.log`
 - Shortcuts resolve to `shortcutDetails.targetId`/`targetMimeType` in `_to_item`, so folder shortcuts are enterable
 - All API calls use `supportsAllDrives=True` and `includeItemsFromAllDrives=True` for shared/team drives
@@ -65,6 +65,12 @@ Detection is probe-based: iterate `probes` list, first match wins. Add new VFS t
 ### Error messages
 
 - `error_text(e)` turns exceptions into short status-line text: Google `HttpError` -> `"<status>: <Google message>"`, Dropbox `ApiError` -> `user_message_text` or the union tag path (`dropbox: path/not_found`), anything else `str(e)`. Used by `Panel.report_error` and the `set_error(...)` exception sites; the log keeps the full exception.
+
+### Archives in Office files and remotes
+
+- `ZipFS.probe` also accepts `ZipFS.OFFICE_EXTS` (`.docx .xlsx .pptx .odt .ods .odp`) when the header is `ZIP_MAGIC` (`PK\x03\x04`); encrypted (OLE) Office files fall through
+- `Panel.enter` on a non-local VFS (no `disk_path`) calls `enter_archive_copy()`: archive probes (TarFS/ZipFS/CompressedFS) are pre-checked by name, the file is downloaded via `fs.read_file` to a `tempfile.mkstemp` copy, and the archive VFS gets `owned_temp`
+- `VFS.release()` = `leave()` + delete `owned_temp`; all panel/app stack unwinds call `release()`. `TEMP_COPIES` tracks live copies and `remove_temp_copies()` runs in `entry()`'s `finally`
 
 ### Screen switching
 

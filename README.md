@@ -277,16 +277,16 @@ The layout is:
 - **Full command line** of the selected process, below the list.
 - **Environment variables** of the selected process at the bottom (read from `/proc/<pid>/environ` on Linux, or `ps eww` on macOS).
 
-| Key                              | Action                                              |
-| -------------------------------- | --------------------------------------------------- |
-| `Tab`                            | Cycle focus: filter → list → env                    |
-| `Up` / `Down`                    | Navigate one entry up / down                        |
-| `PgUp` / `PgDn` / `Left` / `Right` | Navigate one page up / down                       |
-| `Home` / `End`                   | Jump to first / last entry                          |
-| letters / `Backspace`            | Edit the filter                                     |
-| `k` (list focus) / `Ctrl-K`      | Send `SIGKILL` (`kill -9`) with `y/N` confirmation  |
-| `Ctrl-R`                         | Refresh the process list                            |
-| `Esc`                            | Close the modal                                     |
+| Key                                | Action                                             |
+| ---------------------------------- | -------------------------------------------------- |
+| `Tab`                              | Cycle focus: filter → list → env                   |
+| `Up` / `Down`                      | Navigate one entry up / down                       |
+| `PgUp` / `PgDn` / `Left` / `Right` | Navigate one page up / down                        |
+| `Home` / `End`                     | Jump to first / last entry                         |
+| letters / `Backspace`              | Edit the filter                                    |
+| `k` (list focus) / `Ctrl-K`        | Send `SIGKILL` (`kill -9`) with `y/N` confirmation |
+| `Ctrl-R`                           | Refresh the process list                           |
+| `Esc`                              | Close the modal                                    |
 
 Listening ports are gathered via `lsof -iTCP -sTCP:LISTEN -iUDP`. On machines where `lsof` is restricted or not installed, the ports column will simply be empty.
 
@@ -338,17 +338,20 @@ There is no config file on purpose. The script **is** the config.
 
 Entering certain files opens them as virtual directories:
 
-| Extension                                     | VFS    | Description                         |
-| ----------------------------------------------- | ------ | ----------------------------------- |
-| `.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`          | TAR    | Browse tar archives                 |
-| `.zip`                                          | ZIP    | Browse zip archives                 |
-| `.gz`, `.bz2`, `.xz`, `.lzma`                  | \-     | View compressed single files        |
-| `.s3`                                           | S3     | Browse Amazon S3 buckets            |
-| `.gcs`                                          | GCS    | Browse Google Cloud Storage buckets |
-| `.oci`                                          | OCI    | Browse Oracle Cloud Object Storage  |
-| `.gdrive`                                       | GDrive | Browse Google Drive folders         |
-| `.dropbox`                                      | Dropbox | Browse Dropbox via its API         |
-| `.ssh`                                          | SSH    | Browse remote servers over SSH      |
+| Extension                                         | VFS     | Description                             |
+| ------------------------------------------------- | ------- | --------------------------------------- |
+| `.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`             | TAR     | Browse tar archives                     |
+| `.zip`                                            | ZIP     | Browse zip archives                     |
+| `.docx`, `.xlsx`, `.pptx`, `.odt`, `.ods`, `.odp` | ZIP     | Browse Office documents as zip archives |
+| `.gz`, `.bz2`, `.xz`, `.lzma`                     | \-      | View compressed single files            |
+| `.s3`                                             | S3      | Browse Amazon S3 buckets                |
+| `.gcs`                                            | GCS     | Browse Google Cloud Storage buckets     |
+| `.oci`                                            | OCI     | Browse Oracle Cloud Object Storage      |
+| `.gdrive`                                         | GDrive  | Browse Google Drive folders             |
+| `.dropbox`                                        | Dropbox | Browse Dropbox via its API              |
+| `.ssh`                                            | SSH     | Browse remote servers over SSH          |
+
+Office documents (`.docx`, `.xlsx`, `.pptx` and OpenDocument `.odt`, `.ods`, `.odp`) are ZIP containers: `Enter` opens them like a zip archive to browse their XML, media and other parts (only if the file really is a ZIP; encrypted Office files are not). Archives (tar, zip, Office, `.gz`/`.bz2`/`.xz`) inside a remote such as Google Drive, Dropbox or SSH can be entered too: xc downloads a temporary copy, which is deleted when you leave the archive or exit xc.
 
 VFS config files (`.s3`, `.gcs`, `.oci`, `.gdrive`, `.dropbox`, `.ssh`) are simple `key=value` text files. The path header shows the VFS type, e.g. `~/servers/prod.ssh (SSH)`.
 
@@ -401,7 +404,33 @@ With `client_id` (and no `key`), xc logs in through the browser with OAuth2 (PKC
 
 Without `folder`, the top level mirrors the Drive sidebar with three virtual folders: `My Drive`, `Shared with me` and `Shared drives`. `Shared with me` is a flat list of individual files and folders that other people own and shared with you directly. `Shared drives` has one folder per Google Workspace shared drive you are a member of; those files belong to the organisation, and each drive is a full tree you can write to according to your role. The top level, `Shared with me` and `Shared drives` themselves are read-only; inside any real folder you can copy, upload and create folders as usual. `folder=root` starts directly in My Drive, and `folder=<ID>` (the ID from the folder URL) starts in that folder.
 
-Items with the same name in one folder are shown as `report.pdf`, `report (2).pdf`, ... (oldest first). Shortcuts are followed, so a shortcut to a folder can be entered. Google Docs, Sheets, Slides and Drawings are shown with an Office/PNG extension (`.docx`, `.xlsx`, `.pptx`, `.png`) and exported to that format when copied or viewed (Google limits exports to 10 MB); their size shows as 0 because Google does not report it. They cannot be overwritten. Forms, Sites and other Google types without an export format are listed but cannot be copied.
+Items with the same name in one folder are shown as `report.pdf`, `report (2).pdf`, ... (oldest first). Shortcuts are followed, so a shortcut to a folder can be entered. Google Docs, Sheets, Slides and Drawings are not real files: they are exported when copied or viewed, and the panel shows them with the extension of the export format (e.g. `Plan.docx`). Their size shows as 0 because Google does not report it, Google limits exports to 10 MB, and they cannot be overwritten by an upload. Forms, Sites and other Google types without an export format are listed without an extension and cannot be copied.
+
+The export format is set per `.gdrive` file with a preset:
+
+| `export=`          | Docs    | Sheets  | Slides  | Drawings |
+| ------------------ | ------- | ------- | ------- | -------- |
+| `office` (default) | `.docx` | `.xlsx` | `.pptx` | `.png`   |
+| `pdf`              | `.pdf`  | `.pdf`  | `.pdf`  | `.pdf`   |
+| `open`             | `.odt`  | `.ods`  | `.odp`  | `.svg`   |
+| `text`             | `.md`   | `.csv`  | `.txt`  | `.svg`   |
+
+and optional per-type overrides:
+
+```text
+export=office
+export.sheets=csv
+export.slides=pdf
+```
+
+| Key                | Formats                                                    |
+| ------------------ | ---------------------------------------------------------- |
+| `export.docs`      | `docx`, `odt`, `pdf`, `rtf`, `txt`, `md`, `html`, `epub`   |
+| `export.sheets`    | `xlsx`, `ods`, `pdf`, `csv`, `tsv`                         |
+| `export.slides`    | `pptx`, `odp`, `pdf`, `txt`, `png`, `jpg`, `svg`           |
+| `export.drawings`  | `png`, `jpg`, `svg`, `pdf`                                 |
+
+An unknown preset or unsupported format is reported when the remote is opened. CSV/TSV export only the first sheet of a spreadsheet, and PNG/JPG/SVG only the first slide of a presentation. Several `.gdrive` files with the same `account` share one login, so you can keep e.g. `me.gdrive` (Office) and `me-pdf.gdrive` (`export=pdf`) side by side.
 
 With neither `key` nor `client_id`, Google application default credentials are used (e.g. after `gcloud auth application-default login`).
 

@@ -45,7 +45,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "0.2.39"
+VERSION = "0.2.40"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -400,9 +400,24 @@ def copy_local_metadata(
         os.chflags(dst, source.st_flags, follow_symlinks=False)
 
 
+ZIP_MAGIC = b"PK\x03\x04"
+# Temp copies of archives opened from non-local VFS; removed on exit.
+TEMP_COPIES: set[str] = set()
+
+
+def remove_temp_copies() -> None:
+    for path in list(TEMP_COPIES):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    TEMP_COPIES.clear()
+
+
 class VFS(ABC):
     label: str = ""
     session: OAuthSession | None = None  # set by OAuth-backed remotes
+    owned_temp: str = ""  # temp copy this VFS was opened from
 
     @abstractmethod
     def probe(self, header: bytes, filename: str) -> bool: ...
@@ -449,6 +464,19 @@ class VFS(ABC):
 
     def local_path(self, path: str) -> str | None:
         return None
+
+    def release(self) -> None:
+        """Leave the VFS and delete the temp copy it was opened from."""
+        try:
+            self.leave()
+        finally:
+            if self.owned_temp:
+                TEMP_COPIES.discard(self.owned_temp)
+                try:
+                    os.unlink(self.owned_temp)
+                except OSError:
+                    pass
+                self.owned_temp = ""
 
 
 class LocalFS(VFS):
@@ -709,8 +737,16 @@ class ZipFS(VFS):
         self.archive_path: str = ""
         self._infos: dict[str, zipfile.ZipInfo] = {}
 
+    # Office documents that are ZIP containers (OOXML and OpenDocument).
+    OFFICE_EXTS = (".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp")
+
     def probe(self, header: bytes, filename: str) -> bool:
-        return filename.lower().endswith(".zip")
+        lower = filename.lower()
+        if lower.endswith(".zip"):
+            return True
+        # Only when the content really is a ZIP (encrypted Office files
+        # are OLE containers and fall through to the associations).
+        return lower.endswith(self.OFFICE_EXTS) and header.startswith(ZIP_MAGIC)
 
     def enter(self, header: bytes, filename: str, cwd: str = "") -> VFS:
         zf = zipfile.ZipFile(filename, "r")
@@ -1555,30 +1591,107 @@ def _gdrive_login(
 
 GDRIVE_FOLDER = "application/vnd.google-apps.folder"
 GDRIVE_SHORTCUT = "application/vnd.google-apps.shortcut"
-# Google-native files cannot be downloaded as is; they are exported to
-# these formats and shown with the matching extension.
-GDRIVE_EXPORTS: dict[str, tuple[str, str]] = {
-    "application/vnd.google-apps.document": (
-        ".docx",
-        "application/vnd.openxmlformats-officedocument"
-        ".wordprocessingml.document",
+# Google-native files cannot be downloaded as is; they are exported and
+# shown with the extension of the chosen format (config ``export=``).
+GDRIVE_EXPORT_MIME: dict[str, str] = {
+    "docx": "application/vnd.openxmlformats-officedocument"
+    ".wordprocessingml.document",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "pptx": "application/vnd.openxmlformats-officedocument"
+    ".presentationml.presentation",
+    "odt": "application/vnd.oasis.opendocument.text",
+    "ods": "application/vnd.oasis.opendocument.spreadsheet",
+    "odp": "application/vnd.oasis.opendocument.presentation",
+    "pdf": "application/pdf",
+    "rtf": "application/rtf",
+    "txt": "text/plain",
+    "md": "text/markdown",
+    "html": "text/html",
+    "epub": "application/epub+zip",
+    "csv": "text/csv",
+    "tsv": "text/tab-separated-values",
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "svg": "image/svg+xml",
+}
+# Configurable kinds: config key -> (Google MIME type, allowed formats).
+GDRIVE_EXPORT_KINDS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "docs": (
+        "application/vnd.google-apps.document",
+        ("docx", "odt", "pdf", "rtf", "txt", "md", "html", "epub"),
     ),
-    "application/vnd.google-apps.spreadsheet": (
-        ".xlsx",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "sheets": (
+        "application/vnd.google-apps.spreadsheet",
+        ("xlsx", "ods", "pdf", "csv", "tsv"),
     ),
-    "application/vnd.google-apps.presentation": (
-        ".pptx",
-        "application/vnd.openxmlformats-officedocument"
-        ".presentationml.presentation",
+    "slides": (
+        "application/vnd.google-apps.presentation",
+        ("pptx", "odp", "pdf", "txt", "png", "jpg", "svg"),
     ),
-    "application/vnd.google-apps.drawing": (".png", "image/png"),
+    "drawings": (
+        "application/vnd.google-apps.drawing",
+        ("png", "jpg", "svg", "pdf"),
+    ),
+}
+GDRIVE_EXPORT_PRESETS: dict[str, dict[str, str]] = {
+    "office": {
+        "docs": "docx",
+        "sheets": "xlsx",
+        "slides": "pptx",
+        "drawings": "png",
+    },
+    "pdf": {"docs": "pdf", "sheets": "pdf", "slides": "pdf", "drawings": "pdf"},
+    "open": {
+        "docs": "odt",
+        "sheets": "ods",
+        "slides": "odp",
+        "drawings": "svg",
+    },
+    "text": {"docs": "md", "sheets": "csv", "slides": "txt", "drawings": "svg"},
+}
+# Types with a single sensible export, not configurable.
+GDRIVE_EXPORT_FIXED: dict[str, tuple[str, str]] = {
     "application/vnd.google-apps.script": (
         ".json",
         "application/vnd.google-apps.script+json",
     ),
     "application/vnd.google-apps.jam": (".pdf", "application/pdf"),
 }
+
+
+def gdrive_exports(cfg: dict[str, str]) -> dict[str, tuple[str, str]]:
+    """Google MIME type -> (extension, export MIME) from ``export=`` keys.
+
+    ``export=<preset>`` picks office (default), pdf, open or text;
+    ``export.<kind>=<ext>`` overrides docs, sheets, slides or drawings.
+    Raises OSError for unknown presets, kinds or unsupported formats.
+    """
+    preset = (cfg.get("export") or "office").strip().lower()
+    if preset not in GDRIVE_EXPORT_PRESETS:
+        raise OSError(
+            f"export={preset}: use one of " + ", ".join(GDRIVE_EXPORT_PRESETS)
+        )
+    chosen = dict(GDRIVE_EXPORT_PRESETS[preset])
+    for key, val in cfg.items():
+        if not key.startswith("export."):
+            continue
+        kind = key[len("export.") :].strip().lower()
+        if kind not in GDRIVE_EXPORT_KINDS:
+            raise OSError(
+                f"{key}: use one of "
+                + ", ".join(f"export.{k}" for k in GDRIVE_EXPORT_KINDS)
+            )
+        ext = val.strip().lower().lstrip(".")
+        allowed = GDRIVE_EXPORT_KINDS[kind][1]
+        if ext not in allowed:
+            raise OSError(f"{key}={val}: use one of " + ", ".join(allowed))
+        chosen[kind] = ext
+    out = dict(GDRIVE_EXPORT_FIXED)
+    for kind, ext in chosen.items():
+        out[GDRIVE_EXPORT_KINDS[kind][0]] = ("." + ext, GDRIVE_EXPORT_MIME[ext])
+    return out
+
+
 GDRIVE_MY_DRIVE = "My Drive"
 GDRIVE_SHARED_WITH_ME = "Shared with me"
 GDRIVE_SHARED_DRIVES = "Shared drives"
@@ -1623,6 +1736,8 @@ class GDriveFS(VFS):
         # Directory path -> {display name -> item}, filled by listings.
         self._listing: dict[str, dict[str, GItem]] = {}
         self.session: OAuthSession | None = None
+        # Google MIME type -> (extension, export MIME) for native files.
+        self.exports = gdrive_exports({})
 
     def probe(self, header: bytes, filename: str) -> bool:
         if not filename.lower().endswith(".gdrive"):
@@ -1631,6 +1746,7 @@ class GDriveFS(VFS):
 
     def enter(self, header: bytes, filename: str, cwd: str = "") -> VFS:
         cfg, account = _read_kv_config(filename)
+        exports = gdrive_exports(cfg)
         folder_id = cfg.get("folder", "")
         key = cfg.get("key", "")
         from googleapiclient.discovery import build
@@ -1666,6 +1782,7 @@ class GDriveFS(VFS):
         fs.service = service
         fs.session = session
         fs.root_folder_id = folder_id
+        fs.exports = exports
         return fs
 
     def _client(self) -> None:
@@ -1715,8 +1832,7 @@ class GDriveFS(VFS):
             if not page_token:
                 return drives
 
-    @staticmethod
-    def _to_item(raw: dict) -> GItem:
+    def _to_item(self, raw: dict) -> GItem:
         mime = raw.get("mimeType", "")
         item_id = raw["id"]
         if mime == GDRIVE_SHORTCUT:
@@ -1736,17 +1852,16 @@ class GDriveFS(VFS):
             is_dir=mime == GDRIVE_FOLDER,
             size=int(raw.get("size", 0) or 0),
             mod_time=ts,
-            export=GDRIVE_EXPORTS.get(mime, ("", ""))[1],
+            export=self.exports.get(mime, ("", ""))[1],
             native=native,
         )
 
-    @staticmethod
-    def _display_name(raw: dict) -> str:
+    def _display_name(self, raw: dict) -> str:
         name = raw["name"].replace("/", "_")
         mime = raw.get("mimeType", "")
         if mime == GDRIVE_SHORTCUT:
             mime = (raw.get("shortcutDetails") or {}).get("targetMimeType", "")
-        ext = GDRIVE_EXPORTS.get(mime, ("", ""))[0]
+        ext = self.exports.get(mime, ("", ""))[0]
         if ext and not name.lower().endswith(ext):
             name += ext
         return name
@@ -2535,7 +2650,7 @@ class Panel:
         if isinstance(self.fs, GrepFS):
             rel_path = f.name
             base_dir = self.fs.base_dir
-            self.fs.leave()
+            self.fs.release()
             prev = self.stack.pop()
             self.fs = prev.fs
             target_dir = os.path.join(base_dir, os.path.dirname(rel_path))
@@ -2575,6 +2690,7 @@ class Panel:
                 return
         full_path = self.disk_path(f.name)
         if not full_path:
+            self.enter_archive_copy(f)
             return
         header = read_header(full_path, 32)
         for probe in self.probes:
@@ -2604,6 +2720,59 @@ class Panel:
         if ext and ext in ASSOCIATIONS and self.on_run:
             assoc = ASSOCIATIONS[ext]
             self.on_run(assoc.cmd, assoc.fire_and_forget)
+
+    def enter_archive_copy(self, f: VFile) -> None:
+        """Open an archive stored in a non-local VFS from a temp copy.
+
+        The copy is owned by the archive VFS and deleted when it is left.
+        """
+        archive_types = (TarFS, ZipFS, CompressedFS)
+        probes = [
+            p
+            for p in self.probes
+            if isinstance(p, archive_types) and p.probe(ZIP_MAGIC, f.name)
+        ]
+        if not probes:
+            return
+        src = self.vfs_path(f.name)
+        fd, tmp = tempfile.mkstemp(prefix="xc-", suffix="-" + f.name)
+        TEMP_COPIES.add(tmp)
+        owned = False
+        try:
+            with os.fdopen(fd, "wb") as out, self.fs.read_file(src) as inp:
+                shutil.copyfileobj(inp, out)
+            header = read_header(tmp, 32)
+            for probe in probes:
+                if not probe.probe(header, f.name):
+                    continue
+                new_fs = probe.enter(header, tmp, cwd="")
+                new_fs.owned_temp = tmp
+                owned = True
+                base = self.stack[-1].entry_path if self.stack else ""
+                self.stack.append(
+                    VFSEntry(
+                        fs=self.fs,
+                        path=self.path,
+                        cursor=self.cursor,
+                        offset=self.offset,
+                        entry_path=f"{base}/{src}" if base else src,
+                    )
+                )
+                self.fs = new_fs
+                self.path = ""
+                self.cursor = 0
+                self.offset = 0
+                self.load_dir()
+                return
+        except Exception as e:
+            self.report_error(e)
+        finally:
+            if not owned:
+                TEMP_COPIES.discard(tmp)
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
 
     def enter_remote(self, path: str) -> None:
         header = read_header(path, 32)
@@ -2645,7 +2814,7 @@ class Panel:
         else:
             return False
         for fs in chain[k:]:
-            fs.leave()
+            fs.release()
         prev = self.stack[k - 1]
         del self.stack[k - 1 :]
         self.fs = prev.fs
@@ -2658,7 +2827,7 @@ class Panel:
     def go_up(self) -> None:
         at_root = not self.path or os.path.dirname(self.path) == self.path
         if at_root and self.stack:
-            self.fs.leave()
+            self.fs.release()
             prev = self.stack.pop()
             self.fs = prev.fs
             self.path = prev.path
@@ -3841,7 +4010,7 @@ class App:
         p.load_dir()
 
         if not gfs.results:
-            gfs.leave()
+            gfs.release()
             prev = p.stack.pop()
             p.fs = prev.fs
             p.path = prev.path
@@ -4332,7 +4501,7 @@ class App:
             self.set_error("active panel is not a local directory")
             return
         while dst.stack:
-            dst.fs.leave()
+            dst.fs.release()
             dst.fs = dst.stack.pop().fs
         dst.path = src.path
         dst.cursor = 0
@@ -6698,6 +6867,7 @@ def entry():
         pass
     finally:
         oauth_logout_all()
+        remove_temp_copies()
 
 
 if __name__ == "__main__":
