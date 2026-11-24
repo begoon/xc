@@ -1942,7 +1942,9 @@ class GDriveFS(VFS):
         return sort_files(
             [
                 (
-                    VFile(name=name, file_type=FILE_TYPE_DIR)
+                    VFile(
+                        name=name, file_type=FILE_TYPE_DIR, mod_time=it.mod_time
+                    )
                     if it.is_dir
                     else VFile(name=name, size=it.size, mod_time=it.mod_time)
                 )

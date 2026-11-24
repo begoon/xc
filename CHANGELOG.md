@@ -6,6 +6,11 @@ and this project loosely follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Google Drive folders show their modified time, so folders with the same
+  name (e.g. several `Takeout` exports) can be told apart.
+
 ## [0.2.40] - 2026-11-24
 
 ### Added
