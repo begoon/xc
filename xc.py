@@ -7,6 +7,7 @@
 #   "oci",
 #   "google-api-python-client",
 #   "google-auth",
+#   "dropbox",
 # ]
 # ///
 """xc - two-panel console file manager."""
@@ -39,7 +40,7 @@ import zipfile
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 VERSION = "0.2.37"
@@ -1495,6 +1496,275 @@ class GDriveFS(VFS):
         self._id_cache.clear()
 
 
+DROPBOX_UPLOAD_CHUNK = 32 * 1024 * 1024
+
+
+@dataclass
+class DropboxSession:
+    app_key: str
+    access_token: str
+    expires_at: datetime | None  # naive UTC, as returned by the SDK
+
+    def expired(self) -> bool:
+        if self.expires_at is None:
+            return False
+        # Treat the last minute as expired so calls don't fail mid-way.
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        return now >= self.expires_at - timedelta(minutes=1)
+
+    def time_left(self) -> str:
+        """Remaining login time as e.g. ``3h42m``, or ``expired``."""
+        if self.expires_at is None:
+            return ""
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        mins = int((self.expires_at - now).total_seconds() // 60)
+        if mins < 1:
+            return "expired"
+        return f"{mins // 60}h{mins % 60:02d}m" if mins >= 60 else f"{mins}m"
+
+
+# Short-lived Dropbox logins, kept in memory only (never written to disk).
+# They last about 4 hours and are gone when xc exits.
+DROPBOX_SESSIONS: dict[str, DropboxSession] = {}
+
+
+def _dropbox_config(filename: str) -> tuple[dict[str, str], str]:
+    """Parse a .dropbox config; returns (keys, account name)."""
+    cfg: dict[str, str] = {}
+    with open(filename) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            cfg[k.strip()] = v.strip()
+    account = (
+        cfg.get("account") or os.path.splitext(os.path.basename(filename))[0]
+    )
+    return cfg, account
+
+
+def dropbox_logout(account: str) -> str:
+    """Revoke the in-memory Dropbox token for *account* and forget it."""
+    session = DROPBOX_SESSIONS.pop(account, None)
+    if session is None:
+        return f"dropbox: not logged in as {account}"
+    msg = f"dropbox: logged out {account}"
+    if not session.expired():
+        try:
+            import dropbox
+            from dropbox import exceptions
+
+            dbx = dropbox.Dropbox(
+                oauth2_access_token=session.access_token, timeout=5
+            )
+            try:
+                dbx.auth_token_revoke()
+            except exceptions.AuthError:
+                pass  # Already revoked or expired: nothing left to revoke.
+        except Exception as e:
+            log.info("dropbox revoke failed account=%s err=%s", account, e)
+            msg = f"dropbox: {account} forgotten, revoke failed: {e}"
+    log.info("dropbox logout account=%s", account)
+    return msg
+
+
+def dropbox_logout_all() -> None:
+    """Revoke every live Dropbox login; called when xc exits."""
+    for account in list(DROPBOX_SESSIONS):
+        dropbox_logout(account)
+
+
+def _dropbox_login(app_key: str, account: str) -> DropboxSession:
+    """Run the PKCE copy-paste OAuth2 flow on the main screen.
+
+    Requests a short-lived access token only (no refresh token), so the
+    login expires after about 4 hours. Raises OSError if the user aborts.
+    """
+    import webbrowser
+
+    import dropbox
+
+    flow = dropbox.DropboxOAuth2FlowNoRedirect(
+        app_key, use_pkce=True, token_access_type="online"
+    )
+    url = flow.start()
+    curses.endwin()
+    try:
+        print(f"\nDropbox login for account '{account}'.\n")
+        print("Open this URL in a browser, allow access, and copy the code:\n")
+        print(f"  {url}\n")
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+        try:
+            code = input("Enter the code (empty to cancel): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            code = ""
+        if not code:
+            raise OSError("Dropbox login cancelled")
+        result = flow.finish(code)
+    finally:
+        curses.reset_prog_mode()
+        curses.raw()
+        curses.doupdate()
+    session = DropboxSession(
+        app_key=app_key,
+        access_token=result.access_token,
+        expires_at=result.expires_at,
+    )
+    DROPBOX_SESSIONS[account] = session
+    log.info("dropbox login account=%s expires=%s", account, result.expires_at)
+    return session
+
+
+class DropboxFS(VFS):
+    label = "Dropbox"
+
+    def __init__(self) -> None:
+        self.dbx = None
+        self.root = ""
+        self.session: DropboxSession | None = None
+        self.account = ""
+
+    def probe(self, header: bytes, filename: str) -> bool:
+        if not filename.lower().endswith(".dropbox"):
+            return False
+        return header.startswith(b"type=dropbox")
+
+    def enter(self, header: bytes, filename: str, cwd: str = "") -> VFS:
+        import dropbox
+        from dropbox import common, exceptions
+
+        cfg, account = _dropbox_config(filename)
+        app_key = cfg.get("app_key", "")
+        if not app_key:
+            raise OSError(f"no app_key specified in {filename}")
+        team = cfg.get("team", "").lower() in ("1", "true", "yes")
+
+        session = DROPBOX_SESSIONS.get(account)
+        if session and (session.app_key != app_key or session.expired()):
+            DROPBOX_SESSIONS.pop(account, None)
+            session = None
+
+        for attempt in range(2):
+            if session is None:
+                session = _dropbox_login(app_key, account)
+            dbx = dropbox.Dropbox(oauth2_access_token=session.access_token)
+            try:
+                acc = dbx.users_get_current_account()
+                break
+            except exceptions.AuthError:
+                DROPBOX_SESSIONS.pop(account, None)
+                if attempt:
+                    raise
+                log.info("dropbox token rejected account=%s", account)
+                session = None
+
+        if team:
+            ns = acc.root_info.root_namespace_id
+            dbx = dbx.with_path_root(common.PathRoot.root(ns))
+
+        fs = DropboxFS()
+        fs.dbx = dbx
+        fs.session = session
+        fs.account = account
+        fs.root = cfg.get("root", "").strip("/")
+        return fs
+
+    def _client(self):
+        s = self.session
+        if not self.dbx or s is None:
+            raise OSError("Dropbox not connected")
+        if s.expired() or not any(v is s for v in DROPBOX_SESSIONS.values()):
+            raise OSError("Dropbox login expired; re-open the remote")
+        return self.dbx
+
+    def _path(self, path: str) -> str:
+        p = "/".join(x for x in (self.root, path.strip("/")) if x)
+        return "/" + p if p else ""
+
+    @staticmethod
+    def _ts(dt: datetime | None) -> float:
+        if dt is None:
+            return 0.0
+        return dt.replace(tzinfo=timezone.utc).timestamp()
+
+    def read_dir(self, path: str) -> list[VFile]:
+        self._client()
+        from dropbox import files as dbf
+
+        out: list[VFile] = []
+        res = self.dbx.files_list_folder(self._path(path), limit=2000)
+        while True:
+            for e in res.entries:
+                if isinstance(e, dbf.FolderMetadata):
+                    out.append(VFile(name=e.name, file_type=FILE_TYPE_DIR))
+                elif isinstance(e, dbf.FileMetadata):
+                    out.append(
+                        VFile(
+                            name=e.name,
+                            size=e.size,
+                            mod_time=self._ts(e.client_modified),
+                        )
+                    )
+            if not res.has_more:
+                break
+            res = self.dbx.files_list_folder_continue(res.cursor)
+        return sort_files(out)
+
+    def read_file(self, path: str) -> io.IOBase:
+        self._client()
+        _, resp = self.dbx.files_download(self._path(path))
+        try:
+            return io.BytesIO(resp.content)
+        finally:
+            resp.close()
+
+    def write_file(self, path: str, data: io.IOBase) -> None:
+        self._client()
+        from dropbox import files as dbf
+
+        target = self._path(path)
+        mode = dbf.WriteMode.overwrite
+        chunk = data.read(DROPBOX_UPLOAD_CHUNK)
+        if len(chunk) < DROPBOX_UPLOAD_CHUNK:
+            self.dbx.files_upload(chunk, target, mode=mode, mute=True)
+            return
+        start = self.dbx.files_upload_session_start(chunk)
+        cursor = dbf.UploadSessionCursor(
+            session_id=start.session_id, offset=len(chunk)
+        )
+        while True:
+            chunk = data.read(DROPBOX_UPLOAD_CHUNK)
+            if len(chunk) < DROPBOX_UPLOAD_CHUNK:
+                commit = dbf.CommitInfo(path=target, mode=mode, mute=True)
+                self.dbx.files_upload_session_finish(chunk, cursor, commit)
+                return
+            self.dbx.files_upload_session_append_v2(chunk, cursor)
+            cursor.offset += len(chunk)
+
+    def mkdir_all(self, path: str) -> None:
+        self._client()
+        from dropbox import exceptions
+
+        try:
+            self.dbx.files_create_folder_v2(self._path(path))
+        except exceptions.ApiError as e:
+            err = e.error
+            if not (
+                err.is_path()
+                and err.get_path().is_conflict()
+                and err.get_path().get_conflict().is_folder()
+            ):
+                raise
+
+    def leave(self) -> None:
+        self.dbx = None
+        self.session = None
+
+
 def _parse_ls_line(line: str) -> VFile | None:
     """Parse one line of ``ls -la`` output into a VFile."""
     # Expected format:
@@ -2011,6 +2281,30 @@ class Panel:
             self.load_dir()
             return
 
+    def leave_dropbox(self, account: str) -> bool:
+        """Unwind the VFS stack out of the Dropbox remote for *account*.
+
+        Returns True if the panel was inside it and has been moved back to
+        where the remote was opened from.
+        """
+        chain = [e.fs for e in self.stack] + [self.fs]
+        for k in range(1, len(chain)):
+            fs = chain[k]
+            if isinstance(fs, DropboxFS) and fs.account == account:
+                break
+        else:
+            return False
+        for fs in chain[k:]:
+            fs.leave()
+        prev = self.stack[k - 1]
+        del self.stack[k - 1 :]
+        self.fs = prev.fs
+        self.path = prev.path
+        self.cursor = prev.cursor
+        self.offset = prev.offset
+        self.load_dir()
+        return True
+
     def go_up(self) -> None:
         at_root = not self.path or os.path.dirname(self.path) == self.path
         if at_root and self.stack:
@@ -2068,7 +2362,12 @@ class Panel:
         if self.path:
             base = base + "/" + self.path
         if self.fs.label:
-            base = base + " (" + self.fs.label + ")"
+            label = self.fs.label
+            if isinstance(self.fs, DropboxFS) and self.fs.session:
+                left = self.fs.session.time_left()
+                if left:
+                    label += " " + left
+            base = base + " (" + label + ")"
         return base
 
     def selected_file(self) -> VFile | None:
@@ -2473,6 +2772,7 @@ EXT_COLORS: dict[str, int] = {
     ".s3": CP_EXT_REMOTE,
     ".gcs": CP_EXT_REMOTE,
     ".gdrive": CP_EXT_REMOTE,
+    ".dropbox": CP_EXT_REMOTE,
     ".oci": CP_EXT_REMOTE,
     ".ssh": CP_EXT_REMOTE,
     ".tar": CP_EXT_ARCHIVE,
@@ -2627,6 +2927,7 @@ class App:
             GCSFS(),
             OCIFS(),
             GDriveFS(),
+            DropboxFS(),
             SSHFS(),
         ]
 
@@ -3686,6 +3987,12 @@ class App:
         dst.offset = 0
         dst.load_dir()
 
+    def action_dropbox_logout(self, account: str) -> None:
+        msg = dropbox_logout(account)
+        for p in self.panels:
+            p.leave_dropbox(account)
+        self.set_error(msg)
+
     def action_remotes(self) -> None:
         remotes_dir = os.path.join(os.path.expanduser("~"), ".xc", "remotes")
         if not os.path.isdir(remotes_dir):
@@ -3695,7 +4002,8 @@ class App:
             f
             for f in os.listdir(remotes_dir)
             if os.path.isfile(os.path.join(remotes_dir, f))
-            and f.rsplit(".", 1)[-1] in ("s3", "gcs", "ssh")
+            and f.rsplit(".", 1)[-1]
+            in ("s3", "gcs", "oci", "gdrive", "dropbox", "ssh")
         )
         if not files:
             self.set_error("no remotes found")
@@ -3710,6 +4018,27 @@ class App:
                     key,
                     name,
                     lambda p=path: self.panels[self.active].enter_remote(p),
+                )
+            )
+        # Logout entries for Dropbox remotes that have a saved login.
+        accounts: list[str] = []
+        for name in files:
+            if not name.endswith(".dropbox"):
+                continue
+            try:
+                _, account = _dropbox_config(os.path.join(remotes_dir, name))
+            except OSError:
+                continue
+            if account not in accounts and account in DROPBOX_SESSIONS:
+                accounts.append(account)
+        for account in accounts:
+            i = len(items)
+            key = keys[i] if i < len(keys) else str(i)
+            items.append(
+                MenuItem(
+                    key,
+                    f"logout dropbox:{account}",
+                    lambda a=account: self.action_dropbox_logout(a),
                 )
             )
         self.add_menu("remote", items)
@@ -5821,6 +6150,9 @@ class App:
         while True:
             self.draw()
             self.scr.refresh()
+            # Wake up periodically while a Dropbox login is live so the
+            # remaining time in the panel header keeps counting down.
+            self.scr.timeout(30000 if DROPBOX_SESSIONS else -1)
             try:
                 key = self.scr.get_wch()
             except curses.error:
@@ -6010,6 +6342,8 @@ def entry():
         curses.wrapper(main, dirs)
     except (SystemExit, KeyboardInterrupt):
         pass
+    finally:
+        dropbox_logout_all()
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ Single-file Python two-panel file manager with virtual filesystem support.
 
 ## Architecture
 
-- **VFS layer**: Abstract `VFS` base class with implementations: `LocalFS`, `TarFS`, `S3FS`, `GCSFS`, `OCIFS`, `GDriveFS`, `SSHFS`, `GrepFS`
+- **VFS layer**: Abstract `VFS` base class with implementations: `LocalFS`, `TarFS`, `S3FS`, `GCSFS`, `OCIFS`, `GDriveFS`, `DropboxFS`, `SSHFS`, `GrepFS`
 - **Panel**: File list panel with VFS stack for nested navigation
 - **App**: Top-level curses app managing two panels, menus, commands, keymaps
 
@@ -19,7 +19,7 @@ Detection is probe-based: iterate `probes` list, first match wins. Add new VFS t
 
 ### Key conventions
 
-- VFS config files: `.s3`, `.gcs`, `.oci`, `.gdrive`, `.ssh` extensions with key=value content
+- VFS config files: `.s3`, `.gcs`, `.oci`, `.gdrive`, `.dropbox`, `.ssh` extensions with key=value content
 - Macro expansion: `%f` (filename), `%F` (full path), `%x`/`%X` (without extension), `%m`/`%M` (tagged files), `%d`/`%D` (directory), `%&` (background)
 - `%F` on non-local VFS: downloads to temp, runs command, uploads back on success if file changed
 
@@ -38,6 +38,18 @@ Detection is probe-based: iterate `probes` list, first match wins. Add new VFS t
 - Uses `google-api-python-client` Drive API v3
 - Caches folder ID lookups in `_id_cache` (path -> ID mapping)
 - All API calls use `supportsAllDrives=True` and `includeItemsFromAllDrives=True` for shared/team drives
+
+### DropboxFS
+
+- Dropbox VFS via the API (not the local sync folder), config extension `.dropbox`
+- Config keys: `type=dropbox`, `app_key` (required, Dropbox app with PKCE enabled), optional `root`, `account` (session name, default = config basename), `team=1` (Business team space via `with_path_root`)
+- Auth: OAuth2 PKCE copy-paste flow (`_dropbox_login`), no app secret, `token_access_type="online"` (short-lived ~4h access token, no refresh token); runs on the main screen (`curses.endwin()` + `input()`), then restores curses
+- Tokens are never written to disk: `DROPBOX_SESSIONS` (account -> `DropboxSession`) holds them in memory for the life of the process. `enter()` reuses a live session or logs in again; `DropboxFS._client()` raises "login expired; re-open the remote" once the session expired or was logged out
+- `dropbox_logout(account)` revokes via `auth_token_revoke()` and drops the session; the `r` remotes menu adds a `logout dropbox:<account>` item for each `.dropbox` remote with a live session
+- `App.action_dropbox_logout` also calls `Panel.leave_dropbox(account)` on both panels, unwinding the VFS stack back to the local FS the remote was opened from
+- `entry()` calls `dropbox_logout_all()` in `finally`, revoking live tokens on exit (5s timeout per revoke)
+- `display_path()` appends `DropboxSession.time_left()` to the label (`Dropbox 3h42m`); `App.run` uses a 30s `getch` timeout while any session is live so it keeps counting down
+- Uploads > 32 MB use upload sessions; paths are `"/" + root/path`, root itself is `""`
 
 ### Screen switching
 

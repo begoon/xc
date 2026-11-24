@@ -5,6 +5,7 @@ xc
 *.s3
 *.oci
 *.gdrive
+*.dropbox
 *.ssh
 remotes/keys/*.*
 

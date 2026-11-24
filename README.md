@@ -192,7 +192,7 @@ Press `b` to open the **bookmark** menu for quick jumps to common directories (h
 
 ### Remotes (`r`)
 
-Press `r` to open the **remote** menu. This scans `~/.xc/remotes/` for VFS config files (`.s3`, `.gcs`, `.oci`, `.gdrive`, `.ssh`) and presents them as a selector. Choosing a remote opens it on the active panel, just like pressing `Enter` on a VFS config file.
+Press `r` to open the **remote** menu. This scans `~/.xc/remotes/` for VFS config files (`.s3`, `.gcs`, `.oci`, `.gdrive`, `.dropbox`, `.ssh`) and presents them as a selector. Choosing a remote opens it on the active panel, just like pressing `Enter` on a VFS config file.
 
 This lets you keep all your remote connections in one place and access them from any directory without navigating to where the config files live.
 
@@ -347,9 +347,10 @@ Entering certain files opens them as virtual directories:
 | `.gcs`                                          | GCS    | Browse Google Cloud Storage buckets |
 | `.oci`                                          | OCI    | Browse Oracle Cloud Object Storage  |
 | `.gdrive`                                       | GDrive | Browse Google Drive folders         |
+| `.dropbox`                                      | Dropbox | Browse Dropbox via its API         |
 | `.ssh`                                          | SSH    | Browse remote servers over SSH      |
 
-VFS config files (`.s3`, `.gcs`, `.oci`, `.gdrive`, `.ssh`) are simple `key=value` text files. The path header shows the VFS type, e.g. `~/servers/prod.ssh (SSH)`.
+VFS config files (`.s3`, `.gcs`, `.oci`, `.gdrive`, `.dropbox`, `.ssh`) are simple `key=value` text files. The path header shows the VFS type, e.g. `~/servers/prod.ssh (SSH)`.
 
 **S3 example** (`production.s3`):
 
@@ -396,6 +397,17 @@ key=service-account.json
 ```
 
 The `folder` is the ID from the Google Drive folder URL. The `key` path points to a service account JSON credentials file (relative paths are resolved from the config file's directory). If omitted, application default credentials are used. Shared drives and folders shared from other accounts are supported.
+
+**Dropbox example** (`me.dropbox`):
+
+```text
+type=dropbox
+app_key=<your Dropbox app key>
+root=/Work
+account=me
+```
+
+`app_key` is the key of a Dropbox app you register in the [App Console](https://www.dropbox.com/developers/apps) (Scoped access, Full Dropbox, scopes `files.metadata.read/write` and `files.content.read/write`, with "Allow public clients (PKCE)" enabled); the app secret is not needed. Other keys are optional. `root` is the Dropbox folder shown as the top level (default: the whole Dropbox). When you open the remote, xc opens a browser at the Dropbox authorization page and asks for the code it shows (OAuth2 with PKCE, no app secret involved). xc gets a short-lived access token only (about 4 hours, no refresh token) and keeps it in memory: nothing is written to disk, and the login is gone when xc exits or the token expires, after which opening the remote asks you to log in again. `account` (default: the config file name without the extension) names the login, so several config files can share one. The panel header shows the time left, e.g. `me.dropbox/Work (Dropbox 3h42m)`. When xc exits, live Dropbox tokens are revoked. To log out explicitly, pick `logout dropbox:<account>` in the `r` remotes menu: it revokes the token at Dropbox, forgets it, and moves any panel showing that remote back to the local directory it was opened from. `team=1` shows the team space of a Dropbox Business account.
 
 **SSH example** (`prod.ssh`):
 

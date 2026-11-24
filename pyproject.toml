@@ -10,6 +10,7 @@ dependencies = [
     "oci",
     "google-api-python-client",
     "google-auth",
+    "dropbox",
 ]
 
 [project.scripts]
