@@ -1555,6 +1555,30 @@ def _gdrive_login(
 
 GDRIVE_FOLDER = "application/vnd.google-apps.folder"
 GDRIVE_SHORTCUT = "application/vnd.google-apps.shortcut"
+# Google-native files cannot be downloaded as is; they are exported to
+# these formats and shown with the matching extension.
+GDRIVE_EXPORTS: dict[str, tuple[str, str]] = {
+    "application/vnd.google-apps.document": (
+        ".docx",
+        "application/vnd.openxmlformats-officedocument"
+        ".wordprocessingml.document",
+    ),
+    "application/vnd.google-apps.spreadsheet": (
+        ".xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ),
+    "application/vnd.google-apps.presentation": (
+        ".pptx",
+        "application/vnd.openxmlformats-officedocument"
+        ".presentationml.presentation",
+    ),
+    "application/vnd.google-apps.drawing": (".png", "image/png"),
+    "application/vnd.google-apps.script": (
+        ".json",
+        "application/vnd.google-apps.script+json",
+    ),
+    "application/vnd.google-apps.jam": (".pdf", "application/pdf"),
+}
 GDRIVE_MY_DRIVE = "My Drive"
 GDRIVE_SHARED_WITH_ME = "Shared with me"
 GDRIVE_SHARED_DRIVES = "Shared drives"
@@ -1569,6 +1593,8 @@ class GItem:
     size: int = 0
     mod_time: float = 0.0
     virtual: str = ""  # "", "root", "shared" or "drives"
+    export: str = ""  # export MIME type for Google-native files
+    native: bool = False  # Google-native (Docs, Sheets, Forms, ...)
 
 
 def _gdrive_unique_name(name: str, is_dir: bool, taken: set[str]) -> str:
@@ -1702,12 +1728,28 @@ class GDriveFS(VFS):
         mt = raw.get("modifiedTime")
         if mt:
             ts = datetime.fromisoformat(mt.replace("Z", "+00:00")).timestamp()
+        native = mime.startswith("application/vnd.google-apps.") and (
+            mime != GDRIVE_FOLDER
+        )
         return GItem(
             id=item_id,
             is_dir=mime == GDRIVE_FOLDER,
             size=int(raw.get("size", 0) or 0),
             mod_time=ts,
+            export=GDRIVE_EXPORTS.get(mime, ("", ""))[1],
+            native=native,
         )
+
+    @staticmethod
+    def _display_name(raw: dict) -> str:
+        name = raw["name"].replace("/", "_")
+        mime = raw.get("mimeType", "")
+        if mime == GDRIVE_SHORTCUT:
+            mime = (raw.get("shortcutDetails") or {}).get("targetMimeType", "")
+        ext = GDRIVE_EXPORTS.get(mime, ("", ""))[0]
+        if ext and not name.lower().endswith(ext):
+            name += ext
+        return name
 
     def _fetch_children(self, item: GItem) -> dict[str, GItem]:
         if item.virtual == "root":
@@ -1732,10 +1774,10 @@ class GDriveFS(VFS):
         # Stable order so duplicate names get the same suffix every time.
         raw.sort(key=lambda r: (r["name"], r.get("createdTime", ""), r["id"]))
         out: dict[str, GItem] = {}
-        taken = {r["name"] for r in raw}
-        for r in raw:
+        names = [self._display_name(r) for r in raw]
+        taken = set(names)
+        for r, name in zip(raw, names):
             it = self._to_item(r)
-            name = r["name"].replace("/", "_")
             if name in out:
                 name = _gdrive_unique_name(name, it.is_dir, taken)
                 taken.add(name)
@@ -1800,9 +1842,17 @@ class GDriveFS(VFS):
             raise OSError(f"is a folder: {path}")
         from googleapiclient.http import MediaIoBaseDownload
 
-        request = self.service.files().get_media(
-            fileId=item.id, supportsAllDrives=True
-        )
+        if item.native and not item.export:
+            raise OSError(f"Google file type cannot be exported: {path}")
+        if item.export:
+            # Export is limited to 10 MB by Google.
+            request = self.service.files().export_media(
+                fileId=item.id, mimeType=item.export
+            )
+        else:
+            request = self.service.files().get_media(
+                fileId=item.id, supportsAllDrives=True
+            )
         buf = io.BytesIO()
         downloader = MediaIoBaseDownload(buf, request)
         done = False
@@ -1819,6 +1869,8 @@ class GDriveFS(VFS):
         existing = self._children(parent_path, parent, refresh=True).get(name)
         if existing is not None and existing.is_dir:
             raise OSError(f"is a folder: {path}")
+        if existing is not None and existing.native:
+            raise OSError(f"cannot overwrite a Google Docs file: {path}")
         from googleapiclient.http import MediaIoBaseUpload
 
         media = MediaIoBaseUpload(
@@ -3559,6 +3611,8 @@ class App:
     # -- Error --
 
     def set_error(self, msg: str) -> None:
+        if msg:
+            log.info("status error: %s", msg)
         self.err_msg = msg
 
     def progress(self, msg: str) -> bool:

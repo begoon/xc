@@ -6,6 +6,14 @@ and this project loosely follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Google Docs, Sheets, Slides and Drawings are shown as `.docx`, `.xlsx`,
+  `.pptx` and `.png` and exported to that format when copied or viewed.
+  Forms and other types without an export format report a clear error, and
+  native files cannot be overwritten by an upload.
+- Status-line errors are also written to `~/.xc/xc.log`.
+
 ## [0.2.39] - 2026-11-24
 
 ### Added

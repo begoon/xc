@@ -41,6 +41,8 @@ Detection is probe-based: iterate `probes` list, first match wins. Add new VFS t
 - Empty `folder` -> virtual root (`GItem.virtual`): `My Drive` (id `root`), `Shared with me` (`sharedWithMe = true` query), `Shared drives` (`drives().list()`, drive ID used as folder ID). Virtual root/`Shared with me`/`Shared drives` are read-only (`_check_writable`)
 - Paths resolve by listing each parent (`_item()` -> `_children()`), cached in `_listing` (dir path -> {display name -> `GItem`}); `read_dir` always refreshes, writes/mkdir drop the parent listing
 - Duplicate names in a listing get ` (2)`, ` (3)`... before the extension, ordered by (name, createdTime, id) so they are stable (`_gdrive_unique_name`); `/` in names becomes `_`
+- Google-native files (`application/vnd.google-apps.*`, `GItem.native`): `GDRIVE_EXPORTS` maps them to an extension + export MIME (Docs `.docx`, Sheets `.xlsx`, Slides `.pptx`, Drawings `.png`); `_display_name` appends the extension, `read_file` uses `export_media`, `write_file` refuses to overwrite them, types without an export raise
+- `App.set_error` logs every non-empty status message (`status error: ...`) to `~/.xc/xc.log`
 - Shortcuts resolve to `shortcutDetails.targetId`/`targetMimeType` in `_to_item`, so folder shortcuts are enterable
 - All API calls use `supportsAllDrives=True` and `includeItemsFromAllDrives=True` for shared/team drives
 

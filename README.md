@@ -401,7 +401,7 @@ With `client_id` (and no `key`), xc logs in through the browser with OAuth2 (PKC
 
 Without `folder`, the top level mirrors the Drive sidebar with three virtual folders: `My Drive`, `Shared with me` and `Shared drives`. `Shared with me` is a flat list of individual files and folders that other people own and shared with you directly. `Shared drives` has one folder per Google Workspace shared drive you are a member of; those files belong to the organisation, and each drive is a full tree you can write to according to your role. The top level, `Shared with me` and `Shared drives` themselves are read-only; inside any real folder you can copy, upload and create folders as usual. `folder=root` starts directly in My Drive, and `folder=<ID>` (the ID from the folder URL) starts in that folder.
 
-Items with the same name in one folder are shown as `report.pdf`, `report (2).pdf`, ... (oldest first). Shortcuts are followed, so a shortcut to a folder can be entered. Google Docs, Sheets and Slides are listed but cannot be downloaded.
+Items with the same name in one folder are shown as `report.pdf`, `report (2).pdf`, ... (oldest first). Shortcuts are followed, so a shortcut to a folder can be entered. Google Docs, Sheets, Slides and Drawings are shown with an Office/PNG extension (`.docx`, `.xlsx`, `.pptx`, `.png`) and exported to that format when copied or viewed (Google limits exports to 10 MB); their size shows as 0 because Google does not report it. They cannot be overwritten. Forms, Sites and other Google types without an export format are listed but cannot be copied.
 
 With neither `key` nor `client_id`, Google application default credentials are used (e.g. after `gcloud auth application-default login`).
 
