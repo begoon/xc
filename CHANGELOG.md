@@ -6,6 +6,25 @@ and this project loosely follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.38] - 2026-11-24
+
+### Added
+
+- Dropbox remote: `.dropbox` config files (`type=dropbox`, `app_key=...`,
+  optional `root`, `account`, `team=1`) browse Dropbox through its API, not
+  the local sync folder. Login uses the OAuth2 PKCE copy-paste flow in the
+  browser, with no app secret.
+- The Dropbox login is a short-lived (about 4 hours) token kept in memory
+  only, never written to disk. The panel header shows the time left, live
+  tokens are revoked when xc exits, and `logout dropbox:<account>` in the `r`
+  remotes menu revokes it explicitly and returns the panel to the local
+  directory.
+
+### Fixed
+
+- The `r` remotes menu now also lists `.oci` and `.gdrive` files (and
+  `.dropbox`), not only `.s3`, `.gcs` and `.ssh`.
+
 ## [0.2.37] - 2026-11-23
 
 ### Added
