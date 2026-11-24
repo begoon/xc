@@ -6,6 +6,29 @@ and this project loosely follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.39] - 2026-11-24
+
+### Added
+
+- Google Drive OAuth login: with `client_id`/`client_secret` (and no `key`)
+  in a `.gdrive` file, xc logs in through the browser (loopback redirect with
+  PKCE). The token lasts about 1 hour and is kept in memory only, like
+  Dropbox: the time left is shown in the panel header, it is revoked on exit,
+  and `logout gdrive:<account>` in the `r` menu revokes it.
+- `client_secret` may be a 1Password `op://` reference, resolved with
+  `op read` when a login is needed.
+- A `.gdrive` without `folder` opens on a virtual top level with `My Drive`,
+  `Shared with me` and `Shared drives`. `folder=root` starts in My Drive.
+- Google Drive shortcuts are followed, so folder shortcuts can be entered.
+  Items with the same name are shown as `name (2).ext`, `name (3).ext`, ...
+
+### Changed
+
+- Google Drive and Dropbox API errors are shown as short messages in the
+  status line (e.g. Google's own explanation) instead of raw exceptions.
+- `.gdrive` paths are resolved by listing parent folders, so names with
+  quotes and duplicates are handled correctly.
+
 ## [0.2.38] - 2026-11-24
 
 ### Added

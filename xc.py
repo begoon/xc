@@ -35,6 +35,8 @@ import tempfile
 import termios
 import time
 import tty
+import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from abc import ABC, abstractmethod
@@ -43,7 +45,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "0.2.38"
+VERSION = "0.2.39"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -400,6 +402,7 @@ def copy_local_metadata(
 
 class VFS(ABC):
     label: str = ""
+    session: OAuthSession | None = None  # set by OAuth-backed remotes
 
     @abstractmethod
     def probe(self, header: bytes, filename: str) -> bool: ...
@@ -1252,284 +1255,11 @@ class OCIFS(VFS):
         self.client = None
 
 
-class GDriveFS(VFS):
-    label = "GDrive"
+def _read_kv_config(filename: str) -> tuple[dict[str, str], str]:
+    """Parse a key=value remote config; returns (keys, account name).
 
-    def __init__(self) -> None:
-        self.service = None
-        self.root_folder_id = ""
-        self._id_cache: dict[str, str] = {}
-
-    def probe(self, header: bytes, filename: str) -> bool:
-        if not filename.lower().endswith(".gdrive"):
-            return False
-        return header.startswith(b"type=gdrive")
-
-    def enter(self, header: bytes, filename: str, cwd: str = "") -> VFS:
-        folder_id = key = ""
-        with open(filename) as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("folder="):
-                    folder_id = line[len("folder=") :]
-                elif line.startswith("key="):
-                    key = line[len("key=") :]
-        if not folder_id:
-            raise OSError(f"no folder specified in {filename}")
-        if key:
-            key = _expand_home(key)
-            if not os.path.isabs(key):
-                base = cwd if cwd else os.path.dirname(filename)
-                key = os.path.join(base, key)
-        from googleapiclient.discovery import build
-
-        scopes = ["https://www.googleapis.com/auth/drive"]
-        if key:
-            from google.oauth2 import service_account
-
-            creds = service_account.Credentials.from_service_account_file(
-                key, scopes=scopes
-            )
-        else:
-            import google.auth
-
-            creds, _ = google.auth.default(scopes=scopes)
-        service = build("drive", "v3", credentials=creds)
-        fs = GDriveFS()
-        fs.service = service
-        fs.root_folder_id = folder_id
-        fs._id_cache = {"": folder_id}
-        return fs
-
-    def _resolve_id(self, path: str) -> str:
-        if path in self._id_cache:
-            return self._id_cache[path]
-        parts = path.strip("/").split("/")
-        current_path = ""
-        parent_id = self.root_folder_id
-        for part in parts:
-            current_path = f"{current_path}/{part}" if current_path else part
-            if current_path in self._id_cache:
-                parent_id = self._id_cache[current_path]
-                continue
-            escaped = part.replace("\\", "\\\\").replace("'", "\\'")
-            q = (
-                f"'{parent_id}' in parents"
-                f" and name = '{escaped}'"
-                f" and trashed = false"
-            )
-            resp = (
-                self.service.files()
-                .list(
-                    q=q,
-                    fields="files(id)",
-                    pageSize=1,
-                    supportsAllDrives=True,
-                    includeItemsFromAllDrives=True,
-                )
-                .execute()
-            )
-            files = resp.get("files", [])
-            if not files:
-                raise OSError(f"not found: {current_path}")
-            parent_id = files[0]["id"]
-            self._id_cache[current_path] = parent_id
-        return parent_id
-
-    def read_dir(self, path: str) -> list[VFile]:
-        if not self.service:
-            raise OSError("GDrive not connected")
-        folder_id = self._resolve_id(path)
-        q = f"'{folder_id}' in parents and trashed = false"
-        files: list[VFile] = []
-        page_token = None
-        while True:
-            resp = (
-                self.service.files()
-                .list(
-                    q=q,
-                    fields="nextPageToken, files(id, name, mimeType, size, modifiedTime)",
-                    pageSize=1000,
-                    pageToken=page_token,
-                    supportsAllDrives=True,
-                    includeItemsFromAllDrives=True,
-                )
-                .execute()
-            )
-            for item in resp.get("files", []):
-                name = item["name"]
-                child_path = f"{path}/{name}" if path else name
-                self._id_cache[child_path] = item["id"]
-                if item["mimeType"] == "application/vnd.google-apps.folder":
-                    files.append(VFile(name=name, file_type=FILE_TYPE_DIR))
-                else:
-                    size = int(item.get("size", 0))
-                    ts = 0.0
-                    mt = item.get("modifiedTime")
-                    if mt:
-                        from datetime import datetime
-
-                        ts = datetime.fromisoformat(
-                            mt.replace("Z", "+00:00")
-                        ).timestamp()
-                    files.append(VFile(name=name, size=size, mod_time=ts))
-            page_token = resp.get("nextPageToken")
-            if not page_token:
-                break
-        return sort_files(files)
-
-    def read_file(self, path: str) -> io.IOBase:
-        if not self.service:
-            raise OSError("GDrive not connected")
-        file_id = self._resolve_id(path)
-        from googleapiclient.http import MediaIoBaseDownload
-
-        request = self.service.files().get_media(
-            fileId=file_id, supportsAllDrives=True
-        )
-        buf = io.BytesIO()
-        downloader = MediaIoBaseDownload(buf, request)
-        done = False
-        while not done:
-            _, done = downloader.next_chunk()
-        buf.seek(0)
-        return buf
-
-    def write_file(self, path: str, data: io.IOBase) -> None:
-        if not self.service:
-            raise OSError("GDrive not connected")
-        parts = path.rsplit("/", 1)
-        if len(parts) == 2:
-            parent_path, name = parts
-        else:
-            parent_path, name = "", parts[0]
-        parent_id = self._resolve_id(parent_path)
-        escaped = name.replace("\\", "\\\\").replace("'", "\\'")
-        q = (
-            f"'{parent_id}' in parents"
-            f" and name = '{escaped}'"
-            f" and trashed = false"
-        )
-        resp = (
-            self.service.files()
-            .list(
-                q=q,
-                fields="files(id)",
-                pageSize=1,
-                supportsAllDrives=True,
-                includeItemsFromAllDrives=True,
-            )
-            .execute()
-        )
-        existing = resp.get("files", [])
-        from googleapiclient.http import MediaIoBaseUpload
-
-        media = MediaIoBaseUpload(
-            data, mimetype="application/octet-stream", resumable=True
-        )
-        if existing:
-            self.service.files().update(
-                fileId=existing[0]["id"],
-                media_body=media,
-                supportsAllDrives=True,
-            ).execute()
-        else:
-            metadata = {"name": name, "parents": [parent_id]}
-            self.service.files().create(
-                body=metadata,
-                media_body=media,
-                supportsAllDrives=True,
-            ).execute()
-
-    def mkdir_all(self, path: str) -> None:
-        if not self.service:
-            raise OSError("GDrive not connected")
-        parts = path.strip("/").split("/")
-        current_path = ""
-        parent_id = self.root_folder_id
-        for part in parts:
-            current_path = f"{current_path}/{part}" if current_path else part
-            if current_path in self._id_cache:
-                parent_id = self._id_cache[current_path]
-                continue
-            escaped = part.replace("\\", "\\\\").replace("'", "\\'")
-            q = (
-                f"'{parent_id}' in parents"
-                f" and name = '{escaped}'"
-                f" and mimeType = 'application/vnd.google-apps.folder'"
-                f" and trashed = false"
-            )
-            resp = (
-                self.service.files()
-                .list(
-                    q=q,
-                    fields="files(id)",
-                    pageSize=1,
-                    supportsAllDrives=True,
-                    includeItemsFromAllDrives=True,
-                )
-                .execute()
-            )
-            existing = resp.get("files", [])
-            if existing:
-                parent_id = existing[0]["id"]
-            else:
-                metadata = {
-                    "name": part,
-                    "mimeType": "application/vnd.google-apps.folder",
-                    "parents": [parent_id],
-                }
-                created = (
-                    self.service.files()
-                    .create(
-                        body=metadata,
-                        fields="id",
-                        supportsAllDrives=True,
-                    )
-                    .execute()
-                )
-                parent_id = created["id"]
-            self._id_cache[current_path] = parent_id
-
-    def leave(self) -> None:
-        self.service = None
-        self._id_cache.clear()
-
-
-DROPBOX_UPLOAD_CHUNK = 32 * 1024 * 1024
-
-
-@dataclass
-class DropboxSession:
-    app_key: str
-    access_token: str
-    expires_at: datetime | None  # naive UTC, as returned by the SDK
-
-    def expired(self) -> bool:
-        if self.expires_at is None:
-            return False
-        # Treat the last minute as expired so calls don't fail mid-way.
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
-        return now >= self.expires_at - timedelta(minutes=1)
-
-    def time_left(self) -> str:
-        """Remaining login time as e.g. ``3h42m``, or ``expired``."""
-        if self.expires_at is None:
-            return ""
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
-        mins = int((self.expires_at - now).total_seconds() // 60)
-        if mins < 1:
-            return "expired"
-        return f"{mins // 60}h{mins % 60:02d}m" if mins >= 60 else f"{mins}m"
-
-
-# Short-lived Dropbox logins, kept in memory only (never written to disk).
-# They last about 4 hours and are gone when xc exits.
-DROPBOX_SESSIONS: dict[str, DropboxSession] = {}
-
-
-def _dropbox_config(filename: str) -> tuple[dict[str, str], str]:
-    """Parse a .dropbox config; returns (keys, account name)."""
+    The account defaults to the config file name without its extension.
+    """
     cfg: dict[str, str] = {}
     with open(filename) as f:
         for line in f:
@@ -1544,60 +1274,633 @@ def _dropbox_config(filename: str) -> tuple[dict[str, str], str]:
     return cfg, account
 
 
-def dropbox_logout(account: str) -> str:
-    """Revoke the in-memory Dropbox token for *account* and forget it."""
-    session = DROPBOX_SESSIONS.pop(account, None)
+def error_text(err: BaseException) -> str:
+    """Short, readable message for an exception shown in the status line.
+
+    Google API errors are reduced to Google's own message, Dropbox API
+    errors to their error tag path (e.g. ``path/not_found``).
+    """
+    if type(err).__name__ == "HttpError" and hasattr(err, "resp"):
+        try:
+            reason = err._get_reason().strip()  # googleapiclient
+        except Exception:
+            reason = ""
+        status = getattr(err.resp, "status", "")
+        return f"{status}: {reason}" if reason else f"HTTP {status}"
+    if type(err).__name__ == "ApiError" and hasattr(err, "error"):
+        msg = getattr(err, "user_message_text", None)
+        if msg:
+            return msg
+        tags = []
+        e = err.error
+        while getattr(e, "_tag", None):
+            tags.append(e._tag)
+            e = getattr(e, "_value", None)
+        if tags:
+            return "dropbox: " + "/".join(tags)
+    return str(err)
+
+
+@dataclass
+class OAuthSession:
+    """A short-lived OAuth2 login, kept in memory only."""
+
+    kind: str  # "dropbox" or "gdrive"
+    account: str
+    client_id: str
+    access_token: str
+    expires_at: datetime | None  # naive UTC
+    revoke: Callable[[], None]
+
+    @property
+    def key(self) -> str:
+        return f"{self.kind}:{self.account}"
+
+    def expired(self) -> bool:
+        if self.expires_at is None:
+            return False
+        # Treat the last minute as expired so calls don't fail mid-way.
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        return now >= self.expires_at - timedelta(minutes=1)
+
+    def live(self) -> bool:
+        return not self.expired() and OAUTH_SESSIONS.get(self.key) is self
+
+    def time_left(self) -> str:
+        """Remaining login time as e.g. ``3h42m``, or ``expired``."""
+        if self.expires_at is None:
+            return ""
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        mins = int((self.expires_at - now).total_seconds() // 60)
+        if mins < 1:
+            return "expired"
+        return f"{mins // 60}h{mins % 60:02d}m" if mins >= 60 else f"{mins}m"
+
+
+# Short-lived OAuth logins ("kind:account" -> session). Never written to
+# disk: they are gone when they expire or xc exits.
+OAUTH_SESSIONS: dict[str, OAuthSession] = {}
+
+
+def oauth_session(kind: str, account: str, client_id: str):
+    """Return the live session for kind:account, dropping a stale one."""
+    session = OAUTH_SESSIONS.get(f"{kind}:{account}")
+    if session and (session.client_id != client_id or session.expired()):
+        oauth_logout(session.key)  # revokes it if still valid
+        session = None
+    return session
+
+
+def oauth_logout(key: str) -> str:
+    """Revoke the in-memory token for *key* (``kind:account``), forget it."""
+    session = OAUTH_SESSIONS.pop(key, None)
     if session is None:
-        return f"dropbox: not logged in as {account}"
-    msg = f"dropbox: logged out {account}"
+        return f"{key}: not logged in"
+    msg = f"{key}: logged out"
     if not session.expired():
         try:
-            import dropbox
-            from dropbox import exceptions
-
-            dbx = dropbox.Dropbox(
-                oauth2_access_token=session.access_token, timeout=5
-            )
-            try:
-                dbx.auth_token_revoke()
-            except exceptions.AuthError:
-                pass  # Already revoked or expired: nothing left to revoke.
+            session.revoke()
         except Exception as e:
-            log.info("dropbox revoke failed account=%s err=%s", account, e)
-            msg = f"dropbox: {account} forgotten, revoke failed: {e}"
-    log.info("dropbox logout account=%s", account)
+            log.info("oauth revoke failed key=%s err=%s", key, e)
+            msg = f"{key}: forgotten, revoke failed: {e}"
+    log.info("oauth logout key=%s", key)
     return msg
 
 
-def dropbox_logout_all() -> None:
-    """Revoke every live Dropbox login; called when xc exits."""
-    for account in list(DROPBOX_SESSIONS):
-        dropbox_logout(account)
+def oauth_logout_all() -> None:
+    """Revoke every live OAuth login; called when xc exits."""
+    for key in list(OAUTH_SESSIONS):
+        oauth_logout(key)
 
 
-def _dropbox_login(app_key: str, account: str) -> DropboxSession:
+class _MainScreen:
+    """Leave curses for the plain terminal, restore it afterwards."""
+
+    def __enter__(self) -> None:
+        curses.endwin()
+
+    def __exit__(self, *exc) -> None:
+        curses.reset_prog_mode()
+        curses.raw()
+        curses.doupdate()
+
+
+def _open_browser(url: str) -> None:
+    import webbrowser
+
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+
+
+GDRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
+
+
+def resolve_secret(value: str) -> str:
+    """Resolve an ``op://`` 1Password reference via ``op read``.
+
+    Any other value is returned as is.
+    """
+    if not value.startswith("op://"):
+        return value
+    try:
+        res = subprocess.run(
+            ["op", "read", "--no-newline", value],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except FileNotFoundError:
+        raise OSError("op (1Password CLI) not found, needed for op://")
+    except subprocess.TimeoutExpired:
+        raise OSError(f"op read timed out: {value}")
+    if res.returncode != 0:
+        err = res.stderr.strip().splitlines()
+        raise OSError(f"op read failed: {err[-1] if err else value}")
+    return res.stdout
+
+
+def _gdrive_revoke(token: str) -> None:
+    req = urllib.request.Request(
+        "https://oauth2.googleapis.com/revoke",
+        data=urllib.parse.urlencode({"token": token}).encode(),
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(req, timeout=5).close()
+    except urllib.error.HTTPError as e:
+        if e.code != 400:  # 400 = already invalid/expired
+            raise
+
+
+def _gdrive_login(
+    client_id: str, client_secret: str, account: str
+) -> OAuthSession:
+    """Google OAuth2 loopback-redirect flow with PKCE, on the main screen.
+
+    Requests an online access token only (about 1 hour, no refresh
+    token). Raises OSError on cancel, timeout or error.
+    """
+    import base64
+    import hashlib
+    import secrets
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    verifier = secrets.token_urlsafe(64)
+    challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
+        .rstrip(b"=")
+        .decode()
+    )
+    state = secrets.token_urlsafe(16)
+    result: dict[str, str] = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            if q.get("state", [""])[0] != state:
+                self.send_response(404)
+                self.end_headers()
+                return
+            result["code"] = q.get("code", [""])[0]
+            result["error"] = q.get("error", [""])[0]
+            text = (
+                "xc: Google Drive login complete. You can close this tab."
+                if result["code"]
+                else f"xc: Google Drive login failed: {result['error']}"
+            )
+            body = f"<html><body><p>{text}</p></body></html>".encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args) -> None:
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    server.timeout = 1
+    redirect_uri = f"http://127.0.0.1:{server.server_port}"
+    url = "https://accounts.google.com/o/oauth2/v2/auth?" + (
+        urllib.parse.urlencode(
+            {
+                "client_id": client_id,
+                "redirect_uri": redirect_uri,
+                "response_type": "code",
+                "scope": GDRIVE_SCOPE,
+                "access_type": "online",
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "state": state,
+            }
+        )
+    )
+    with _MainScreen():
+        try:
+            print(f"\nGoogle Drive login for account '{account}'.\n")
+            print("Open this URL in a browser and allow access:\n")
+            print(f"  {url}\n")
+            print("Waiting for the browser (Ctrl-C to cancel)...")
+            _open_browser(url)
+            deadline = time.monotonic() + 300
+            try:
+                while not result and time.monotonic() < deadline:
+                    server.handle_request()
+            except KeyboardInterrupt:
+                raise OSError("Google Drive login cancelled")
+        finally:
+            server.server_close()
+    if not result.get("code"):
+        raise OSError(
+            "Google Drive login failed: " + (result.get("error") or "timeout")
+        )
+    req = urllib.request.Request(
+        "https://oauth2.googleapis.com/token",
+        data=urllib.parse.urlencode(
+            {
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "code": result["code"],
+                "code_verifier": verifier,
+                "grant_type": "authorization_code",
+                "redirect_uri": redirect_uri,
+            }
+        ).encode(),
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            tok = json.load(resp)
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")
+        raise OSError(f"Google token exchange failed: {detail}") from None
+    access_token = tok["access_token"]
+    expires_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(
+        seconds=int(tok.get("expires_in", 3600))
+    )
+    session = OAuthSession(
+        kind="gdrive",
+        account=account,
+        client_id=client_id,
+        access_token=access_token,
+        expires_at=expires_at,
+        revoke=lambda: _gdrive_revoke(access_token),
+    )
+    OAUTH_SESSIONS[session.key] = session
+    log.info("gdrive login account=%s expires=%s", account, expires_at)
+    return session
+
+
+GDRIVE_FOLDER = "application/vnd.google-apps.folder"
+GDRIVE_SHORTCUT = "application/vnd.google-apps.shortcut"
+GDRIVE_MY_DRIVE = "My Drive"
+GDRIVE_SHARED_WITH_ME = "Shared with me"
+GDRIVE_SHARED_DRIVES = "Shared drives"
+
+
+@dataclass
+class GItem:
+    """A resolved Google Drive entry (or one of the virtual folders)."""
+
+    id: str
+    is_dir: bool
+    size: int = 0
+    mod_time: float = 0.0
+    virtual: str = ""  # "", "root", "shared" or "drives"
+
+
+def _gdrive_unique_name(name: str, is_dir: bool, taken: set[str]) -> str:
+    """``report.pdf`` -> ``report (2).pdf`` (first free number)."""
+    base, ext = (name, "") if is_dir else os.path.splitext(name)
+    n = 2
+    while True:
+        cand = f"{base} ({n}){ext}"
+        if cand not in taken:
+            return cand
+        n += 1
+
+
+class GDriveFS(VFS):
+    label = "GDrive"
+    LIST_FIELDS = (
+        "nextPageToken, files(id, name, mimeType, size, modifiedTime,"
+        " createdTime, shortcutDetails)"
+    )
+
+    def __init__(self) -> None:
+        self.service = None
+        # Folder ID shown as the top level; "" = virtual root with
+        # My Drive / Shared with me / Shared drives.
+        self.root_folder_id = ""
+        # Directory path -> {display name -> item}, filled by listings.
+        self._listing: dict[str, dict[str, GItem]] = {}
+        self.session: OAuthSession | None = None
+
+    def probe(self, header: bytes, filename: str) -> bool:
+        if not filename.lower().endswith(".gdrive"):
+            return False
+        return header.startswith(b"type=gdrive")
+
+    def enter(self, header: bytes, filename: str, cwd: str = "") -> VFS:
+        cfg, account = _read_kv_config(filename)
+        folder_id = cfg.get("folder", "")
+        key = cfg.get("key", "")
+        from googleapiclient.discovery import build
+
+        session = None
+        if key:
+            key = _expand_home(key)
+            if not os.path.isabs(key):
+                base = cwd if cwd else os.path.dirname(filename)
+                key = os.path.join(base, key)
+            from google.oauth2 import service_account
+
+            creds = service_account.Credentials.from_service_account_file(
+                key, scopes=[GDRIVE_SCOPE]
+            )
+        elif cfg.get("client_id"):
+            client_id = cfg["client_id"]
+            if not cfg.get("client_secret"):
+                raise OSError(f"no client_secret specified in {filename}")
+            from google.oauth2.credentials import Credentials
+
+            session = oauth_session("gdrive", account, client_id)
+            if session is None:
+                client_secret = resolve_secret(cfg["client_secret"])
+                session = _gdrive_login(client_id, client_secret, account)
+            creds = Credentials(token=session.access_token)
+        else:
+            import google.auth
+
+            creds, _ = google.auth.default(scopes=[GDRIVE_SCOPE])
+        service = build("drive", "v3", credentials=creds, cache_discovery=False)
+        fs = GDriveFS()
+        fs.service = service
+        fs.session = session
+        fs.root_folder_id = folder_id
+        return fs
+
+    def _client(self) -> None:
+        if not self.service:
+            raise OSError("GDrive not connected")
+        if self.session is not None and not self.session.live():
+            raise OSError("Google Drive login expired; re-open the remote")
+
+    # -- listing --
+
+    def _query(self, q: str) -> list[dict]:
+        items: list[dict] = []
+        page_token = None
+        while True:
+            resp = (
+                self.service.files()
+                .list(
+                    q=q,
+                    fields=self.LIST_FIELDS,
+                    pageSize=1000,
+                    pageToken=page_token,
+                    supportsAllDrives=True,
+                    includeItemsFromAllDrives=True,
+                )
+                .execute()
+            )
+            items.extend(resp.get("files", []))
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                return items
+
+    def _shared_drives(self) -> list[dict]:
+        drives: list[dict] = []
+        page_token = None
+        while True:
+            resp = (
+                self.service.drives()
+                .list(
+                    pageSize=100,
+                    pageToken=page_token,
+                    fields="nextPageToken, drives(id, name)",
+                )
+                .execute()
+            )
+            drives.extend(resp.get("drives", []))
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                return drives
+
+    @staticmethod
+    def _to_item(raw: dict) -> GItem:
+        mime = raw.get("mimeType", "")
+        item_id = raw["id"]
+        if mime == GDRIVE_SHORTCUT:
+            # Follow the shortcut to its target so folders can be entered.
+            details = raw.get("shortcutDetails") or {}
+            item_id = details.get("targetId", item_id)
+            mime = details.get("targetMimeType", "")
+        ts = 0.0
+        mt = raw.get("modifiedTime")
+        if mt:
+            ts = datetime.fromisoformat(mt.replace("Z", "+00:00")).timestamp()
+        return GItem(
+            id=item_id,
+            is_dir=mime == GDRIVE_FOLDER,
+            size=int(raw.get("size", 0) or 0),
+            mod_time=ts,
+        )
+
+    def _fetch_children(self, item: GItem) -> dict[str, GItem]:
+        if item.virtual == "root":
+            return {
+                GDRIVE_MY_DRIVE: GItem(id="root", is_dir=True),
+                GDRIVE_SHARED_WITH_ME: GItem(
+                    id="", is_dir=True, virtual="shared"
+                ),
+                GDRIVE_SHARED_DRIVES: GItem(
+                    id="", is_dir=True, virtual="drives"
+                ),
+            }
+        if item.virtual == "drives":
+            raw = [
+                {"id": d["id"], "name": d["name"], "mimeType": GDRIVE_FOLDER}
+                for d in self._shared_drives()
+            ]
+        elif item.virtual == "shared":
+            raw = self._query("sharedWithMe = true and trashed = false")
+        else:
+            raw = self._query(f"'{item.id}' in parents and trashed = false")
+        # Stable order so duplicate names get the same suffix every time.
+        raw.sort(key=lambda r: (r["name"], r.get("createdTime", ""), r["id"]))
+        out: dict[str, GItem] = {}
+        taken = {r["name"] for r in raw}
+        for r in raw:
+            it = self._to_item(r)
+            name = r["name"].replace("/", "_")
+            if name in out:
+                name = _gdrive_unique_name(name, it.is_dir, taken)
+                taken.add(name)
+            out[name] = it
+        return out
+
+    def _children(
+        self, path: str, item: GItem, refresh: bool = False
+    ) -> dict[str, GItem]:
+        if refresh or path not in self._listing:
+            self._listing[path] = self._fetch_children(item)
+        return self._listing[path]
+
+    def _root(self) -> GItem:
+        if not self.root_folder_id:
+            return GItem(id="", is_dir=True, virtual="root")
+        return GItem(id=self.root_folder_id, is_dir=True)
+
+    def _item(self, path: str) -> GItem:
+        path = path.strip("/")
+        if not path:
+            return self._root()
+        parent_path, _, name = path.rpartition("/")
+        parent = self._item(parent_path)
+        if not parent.is_dir:
+            raise OSError(f"not a folder: {parent_path}")
+        children = self._children(parent_path, parent)
+        if name not in children:
+            children = self._children(parent_path, parent, refresh=True)
+        if name not in children:
+            raise OSError(f"not found: {path}")
+        return children[name]
+
+    @staticmethod
+    def _check_writable(item: GItem, path: str) -> None:
+        if item.virtual in ("root", "shared", "drives"):
+            where = path.strip("/") or "the top level"
+            raise OSError(f"GDrive: cannot create items in {where}")
+
+    # -- VFS API --
+
+    def read_dir(self, path: str) -> list[VFile]:
+        self._client()
+        path = path.strip("/")
+        item = self._item(path)
+        children = self._children(path, item, refresh=True)
+        return sort_files(
+            [
+                (
+                    VFile(name=name, file_type=FILE_TYPE_DIR)
+                    if it.is_dir
+                    else VFile(name=name, size=it.size, mod_time=it.mod_time)
+                )
+                for name, it in children.items()
+            ]
+        )
+
+    def read_file(self, path: str) -> io.IOBase:
+        self._client()
+        item = self._item(path)
+        if item.is_dir:
+            raise OSError(f"is a folder: {path}")
+        from googleapiclient.http import MediaIoBaseDownload
+
+        request = self.service.files().get_media(
+            fileId=item.id, supportsAllDrives=True
+        )
+        buf = io.BytesIO()
+        downloader = MediaIoBaseDownload(buf, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        buf.seek(0)
+        return buf
+
+    def write_file(self, path: str, data: io.IOBase) -> None:
+        self._client()
+        parent_path, _, name = path.strip("/").rpartition("/")
+        parent = self._item(parent_path)
+        self._check_writable(parent, parent_path)
+        existing = self._children(parent_path, parent, refresh=True).get(name)
+        if existing is not None and existing.is_dir:
+            raise OSError(f"is a folder: {path}")
+        from googleapiclient.http import MediaIoBaseUpload
+
+        media = MediaIoBaseUpload(
+            data, mimetype="application/octet-stream", resumable=True
+        )
+        if existing is not None:
+            self.service.files().update(
+                fileId=existing.id,
+                media_body=media,
+                supportsAllDrives=True,
+            ).execute()
+        else:
+            self.service.files().create(
+                body={"name": name, "parents": [parent.id]},
+                media_body=media,
+                supportsAllDrives=True,
+            ).execute()
+        self._listing.pop(parent_path, None)
+
+    def mkdir_all(self, path: str) -> None:
+        self._client()
+        current = ""
+        for part in path.strip("/").split("/"):
+            parent_path, current = current, (
+                f"{current}/{part}" if current else part
+            )
+            parent = self._item(parent_path)
+            existing = self._children(parent_path, parent).get(part)
+            if existing is not None:
+                if not existing.is_dir:
+                    raise OSError(f"not a folder: {current}")
+                continue
+            self._check_writable(parent, parent_path)
+            self.service.files().create(
+                body={
+                    "name": part,
+                    "mimeType": GDRIVE_FOLDER,
+                    "parents": [parent.id],
+                },
+                fields="id",
+                supportsAllDrives=True,
+            ).execute()
+            self._listing.pop(parent_path, None)
+
+    def leave(self) -> None:
+        self.service = None
+        self.session = None
+        self._listing.clear()
+
+
+DROPBOX_UPLOAD_CHUNK = 32 * 1024 * 1024
+
+
+def _dropbox_revoke(token: str) -> None:
+    import dropbox
+    from dropbox import exceptions
+
+    try:
+        dropbox.Dropbox(
+            oauth2_access_token=token, timeout=5
+        ).auth_token_revoke()
+    except exceptions.AuthError:
+        pass  # Already revoked or expired: nothing left to revoke.
+
+
+def _dropbox_login(app_key: str, account: str) -> OAuthSession:
     """Run the PKCE copy-paste OAuth2 flow on the main screen.
 
     Requests a short-lived access token only (no refresh token), so the
     login expires after about 4 hours. Raises OSError if the user aborts.
     """
-    import webbrowser
-
     import dropbox
 
     flow = dropbox.DropboxOAuth2FlowNoRedirect(
         app_key, use_pkce=True, token_access_type="online"
     )
     url = flow.start()
-    curses.endwin()
-    try:
+    with _MainScreen():
         print(f"\nDropbox login for account '{account}'.\n")
         print("Open this URL in a browser, allow access, and copy the code:\n")
         print(f"  {url}\n")
-        try:
-            webbrowser.open(url)
-        except Exception:
-            pass
+        _open_browser(url)
         try:
             code = input("Enter the code (empty to cancel): ").strip()
         except (EOFError, KeyboardInterrupt):
@@ -1605,16 +1908,16 @@ def _dropbox_login(app_key: str, account: str) -> DropboxSession:
         if not code:
             raise OSError("Dropbox login cancelled")
         result = flow.finish(code)
-    finally:
-        curses.reset_prog_mode()
-        curses.raw()
-        curses.doupdate()
-    session = DropboxSession(
-        app_key=app_key,
-        access_token=result.access_token,
+    token = result.access_token
+    session = OAuthSession(
+        kind="dropbox",
+        account=account,
+        client_id=app_key,
+        access_token=token,
         expires_at=result.expires_at,
+        revoke=lambda: _dropbox_revoke(token),
     )
-    DROPBOX_SESSIONS[account] = session
+    OAUTH_SESSIONS[session.key] = session
     log.info("dropbox login account=%s expires=%s", account, result.expires_at)
     return session
 
@@ -1625,8 +1928,7 @@ class DropboxFS(VFS):
     def __init__(self) -> None:
         self.dbx = None
         self.root = ""
-        self.session: DropboxSession | None = None
-        self.account = ""
+        self.session: OAuthSession | None = None
 
     def probe(self, header: bytes, filename: str) -> bool:
         if not filename.lower().endswith(".dropbox"):
@@ -1637,16 +1939,13 @@ class DropboxFS(VFS):
         import dropbox
         from dropbox import common, exceptions
 
-        cfg, account = _dropbox_config(filename)
+        cfg, account = _read_kv_config(filename)
         app_key = cfg.get("app_key", "")
         if not app_key:
             raise OSError(f"no app_key specified in {filename}")
         team = cfg.get("team", "").lower() in ("1", "true", "yes")
 
-        session = DROPBOX_SESSIONS.get(account)
-        if session and (session.app_key != app_key or session.expired()):
-            DROPBOX_SESSIONS.pop(account, None)
-            session = None
+        session = oauth_session("dropbox", account, app_key)
 
         for attempt in range(2):
             if session is None:
@@ -1656,7 +1955,7 @@ class DropboxFS(VFS):
                 acc = dbx.users_get_current_account()
                 break
             except exceptions.AuthError:
-                DROPBOX_SESSIONS.pop(account, None)
+                OAUTH_SESSIONS.pop(session.key, None)
                 if attempt:
                     raise
                 log.info("dropbox token rejected account=%s", account)
@@ -1669,7 +1968,6 @@ class DropboxFS(VFS):
         fs = DropboxFS()
         fs.dbx = dbx
         fs.session = session
-        fs.account = account
         fs.root = cfg.get("root", "").strip("/")
         return fs
 
@@ -1677,7 +1975,7 @@ class DropboxFS(VFS):
         s = self.session
         if not self.dbx or s is None:
             raise OSError("Dropbox not connected")
-        if s.expired() or not any(v is s for v in DROPBOX_SESSIONS.values()):
+        if not s.live():
             raise OSError("Dropbox login expired; re-open the remote")
         return self.dbx
 
@@ -2152,7 +2450,7 @@ class Panel:
     def report_error(self, err: Exception) -> None:
         log.error("panel error path=%s err=%s", self.path, err)
         if self.on_error:
-            self.on_error(str(err))
+            self.on_error(error_text(err))
 
     def load_dir(self) -> None:
         self.tagged = {}
@@ -2281,16 +2579,16 @@ class Panel:
             self.load_dir()
             return
 
-    def leave_dropbox(self, account: str) -> bool:
-        """Unwind the VFS stack out of the Dropbox remote for *account*.
+    def leave_session(self, key: str) -> bool:
+        """Unwind the VFS stack out of the remote logged in as *key*.
 
         Returns True if the panel was inside it and has been moved back to
         where the remote was opened from.
         """
         chain = [e.fs for e in self.stack] + [self.fs]
         for k in range(1, len(chain)):
-            fs = chain[k]
-            if isinstance(fs, DropboxFS) and fs.account == account:
+            session = chain[k].session
+            if session is not None and session.key == key:
                 break
         else:
             return False
@@ -2363,7 +2661,7 @@ class Panel:
             base = base + "/" + self.path
         if self.fs.label:
             label = self.fs.label
-            if isinstance(self.fs, DropboxFS) and self.fs.session:
+            if self.fs.session is not None:
                 left = self.fs.session.time_left()
                 if left:
                     label += " " + left
@@ -3482,7 +3780,7 @@ class App:
                     except (OSError, PermissionError):
                         continue
         except Exception as e:
-            self.set_error(str(e))
+            self.set_error(error_text(e))
         finally:
             self.scr.nodelay(False)
 
@@ -3615,7 +3913,7 @@ class App:
                             self.panels[1].reload()
                             return True
             except Exception as e:
-                self.set_error(str(e))
+                self.set_error(error_text(e))
                 return False
         is_dir = (
             os.path.isdir(src_path) and not os.path.islink(src_path)
@@ -3698,7 +3996,7 @@ class App:
                         follow_symlinks=False,
                     )
         except Exception as e:
-            self.set_error(str(e))
+            self.set_error(error_text(e))
             return False
         finally:
             if staging is not None and os.path.lexists(staging):
@@ -3729,12 +4027,12 @@ class App:
             else:
                 dst_fs.mkdir_all(dst_path)
         except Exception as e:
-            self.set_error(str(e))
+            self.set_error(error_text(e))
             return False
         try:
             files = src_fs.read_dir(src_path)
         except Exception as e:
-            self.set_error(str(e))
+            self.set_error(error_text(e))
             return False
         ok = True
         for f in files:
@@ -3753,7 +4051,7 @@ class App:
             else:
                 dst_fs.set_metadata(dst_path, metadata)
         except Exception as e:
-            self.set_error(str(e))
+            self.set_error(error_text(e))
             ok = False
         return ok
 
@@ -3778,7 +4076,7 @@ class App:
             try:
                 src_fs._batch_data = src_fs.read_files(paths)
             except Exception as e:
-                self.set_error(str(e))
+                self.set_error(error_text(e))
                 return []
         copied: list[str] = []
         try:
@@ -3809,7 +4107,7 @@ class App:
             else:
                 os.remove(dp)
         except Exception as e:
-            self.set_error(str(e))
+            self.set_error(error_text(e))
             return
         p.reload()
 
@@ -3864,12 +4162,12 @@ class App:
                 try:
                     p.fs.mkdir_all(vfs_join(p.fs, p.path, name))
                 except Exception as e:
-                    self.set_error(str(e))
+                    self.set_error(error_text(e))
             else:
                 try:
                     os.makedirs(dp, exist_ok=True)
                 except Exception as e:
-                    self.set_error(str(e))
+                    self.set_error(error_text(e))
             p.reload()
 
         self.show_prompt("mkdir: ", "", do_it)
@@ -3884,7 +4182,7 @@ class App:
             try:
                 open(dp, "a").close()
             except Exception as e:
-                self.set_error(str(e))
+                self.set_error(error_text(e))
             p.reload()
 
         self.show_prompt("new file: ", "", do_it)
@@ -3901,7 +4199,7 @@ class App:
         try:
             info = os.stat(dp)
         except Exception as e:
-            self.set_error(str(e))
+            self.set_error(error_text(e))
             return
         current = f"{stat.S_IMODE(info.st_mode):04o}"
 
@@ -3914,7 +4212,7 @@ class App:
             try:
                 os.chmod(dp, mode)
             except Exception as e:
-                self.set_error(str(e))
+                self.set_error(error_text(e))
             p.reload()
 
         self.show_prompt("chmod: ", current, do_it)
@@ -3947,7 +4245,7 @@ class App:
             try:
                 os.rename(dp, new_path)
             except Exception as e:
-                self.set_error(str(e))
+                self.set_error(error_text(e))
             p.reload()
 
         self.show_prompt("rename to: ", f.name, do_it)
@@ -3987,10 +4285,10 @@ class App:
         dst.offset = 0
         dst.load_dir()
 
-    def action_dropbox_logout(self, account: str) -> None:
-        msg = dropbox_logout(account)
+    def action_oauth_logout(self, key: str) -> None:
+        msg = oauth_logout(key)
         for p in self.panels:
-            p.leave_dropbox(account)
+            p.leave_session(key)
         self.set_error(msg)
 
     def action_remotes(self) -> None:
@@ -4020,25 +4318,27 @@ class App:
                     lambda p=path: self.panels[self.active].enter_remote(p),
                 )
             )
-        # Logout entries for Dropbox remotes that have a saved login.
-        accounts: list[str] = []
+        # Logout entries for remotes with a live OAuth login.
+        logins: list[str] = []
         for name in files:
-            if not name.endswith(".dropbox"):
+            kind = name.rsplit(".", 1)[-1]
+            if kind not in ("dropbox", "gdrive"):
                 continue
             try:
-                _, account = _dropbox_config(os.path.join(remotes_dir, name))
+                _, account = _read_kv_config(os.path.join(remotes_dir, name))
             except OSError:
                 continue
-            if account not in accounts and account in DROPBOX_SESSIONS:
-                accounts.append(account)
-        for account in accounts:
+            k = f"{kind}:{account}"
+            if k not in logins and k in OAUTH_SESSIONS:
+                logins.append(k)
+        for k in logins:
             i = len(items)
             key = keys[i] if i < len(keys) else str(i)
             items.append(
                 MenuItem(
                     key,
-                    f"logout dropbox:{account}",
-                    lambda a=account: self.action_dropbox_logout(a),
+                    f"logout {k}",
+                    lambda k=k: self.action_oauth_logout(k),
                 )
             )
         self.add_menu("remote", items)
@@ -4072,7 +4372,7 @@ class App:
             with p.fs.read_file(remote_path) as data:
                 content = data.read()
         except Exception as e:
-            self.set_error(f"download: {e}")
+            self.set_error(f"download: {error_text(e)}")
             return
 
         tmp_fd, tmp_path = tempfile.mkstemp(suffix=ext, prefix="xc-")
@@ -4113,7 +4413,7 @@ class App:
             else:
                 self.set_error(f"error: exit code = {rc}")
         except Exception as e:
-            self.set_error(str(e))
+            self.set_error(error_text(e))
         finally:
             try:
                 os.unlink(tmp_path)
@@ -6150,9 +6450,9 @@ class App:
         while True:
             self.draw()
             self.scr.refresh()
-            # Wake up periodically while a Dropbox login is live so the
+            # Wake up periodically while an OAuth login is live so the
             # remaining time in the panel header keeps counting down.
-            self.scr.timeout(30000 if DROPBOX_SESSIONS else -1)
+            self.scr.timeout(30000 if OAUTH_SESSIONS else -1)
             try:
                 key = self.scr.get_wch()
             except curses.error:
@@ -6343,7 +6643,7 @@ def entry():
     except (SystemExit, KeyboardInterrupt):
         pass
     finally:
-        dropbox_logout_all()
+        oauth_logout_all()
 
 
 if __name__ == "__main__":

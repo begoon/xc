@@ -388,7 +388,24 @@ OCI_KEY_FILE=my-key.pem
 
 `OCI_KEY_FILE` is a path to a PEM private key file. Alternatively, use `OCI_KEY_BASE64` to embed the key inline as base64. If neither is provided, the default OCI config (`~/.oci/config`) is used.
 
-**Google Drive example** (`shared.gdrive`):
+**Google Drive example** (`me.gdrive`), logging in as yourself:
+
+```text
+type=gdrive
+client_id=1234567890-abc.apps.googleusercontent.com
+client_secret=GOCSPX-...
+folder=1Z_NJ0-LAPzaO7eursL92DWPmFKQT3lpK
+```
+
+With `client_id` (and no `key`), xc logs in through the browser with OAuth2 (PKCE, loopback redirect to `http://127.0.0.1:<random port>`). Create the client in the Google Cloud Console: enable the Google Drive API, configure the OAuth consent screen, and create an OAuth client ID of type **Desktop app**. Google requires the client secret for desktop apps but does not treat it as confidential. `client_secret` may be a 1Password reference (`op://vault/item/field`), resolved with `op read` when a login is needed; any other value is used as is. The login is a short-lived access token (about 1 hour, no refresh token) kept in memory only, exactly like Dropbox below: the panel header shows the time left, the token is revoked when xc exits, and `logout gdrive:<account>` in the `r` remotes menu revokes it explicitly. `account` defaults to the config file name without the extension.
+
+Without `folder`, the top level mirrors the Drive sidebar with three virtual folders: `My Drive`, `Shared with me` and `Shared drives`. `Shared with me` is a flat list of individual files and folders that other people own and shared with you directly. `Shared drives` has one folder per Google Workspace shared drive you are a member of; those files belong to the organisation, and each drive is a full tree you can write to according to your role. The top level, `Shared with me` and `Shared drives` themselves are read-only; inside any real folder you can copy, upload and create folders as usual. `folder=root` starts directly in My Drive, and `folder=<ID>` (the ID from the folder URL) starts in that folder.
+
+Items with the same name in one folder are shown as `report.pdf`, `report (2).pdf`, ... (oldest first). Shortcuts are followed, so a shortcut to a folder can be entered. Google Docs, Sheets and Slides are listed but cannot be downloaded.
+
+With neither `key` nor `client_id`, Google application default credentials are used (e.g. after `gcloud auth application-default login`).
+
+With a service account instead (`shared.gdrive`):
 
 ```text
 type=gdrive
@@ -396,7 +413,7 @@ folder=1Z_NJ0-LAPzaO7eursL92DWPmFKQT3lpK
 key=service-account.json
 ```
 
-The `folder` is the ID from the Google Drive folder URL. The `key` path points to a service account JSON credentials file (relative paths are resolved from the config file's directory). If omitted, application default credentials are used. Shared drives and folders shared from other accounts are supported.
+The `key` path points to a service account JSON credentials file (relative paths are resolved from the config file's directory). The service account only sees what was shared with its email address; without `folder`, those items appear under `Shared with me`, and shared drives it is a member of under `Shared drives`. Shared drives and folders shared from other accounts are supported.
 
 **Dropbox example** (`me.dropbox`):
 

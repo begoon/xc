@@ -33,23 +33,36 @@ Detection is probe-based: iterate `probes` list, first match wins. Add new VFS t
 ### GDriveFS
 
 - Google Drive VFS, config extension `.gdrive`
-- Config keys: `type=gdrive`, `folder` (root folder ID), `key` (service account JSON path)
-- Falls back to `google.auth.default()` if no key provided
+- Config keys: `type=gdrive`, `folder` (start folder ID; `root` = My Drive; empty = virtual root), and either `key` (service account JSON path) or `client_id` + `client_secret` (OAuth "Desktop app" client), optional `account`
+- Auth order: `key` → service account; else `client_id` → OAuth; else `google.auth.default()`
+- `client_secret` goes through `resolve_secret()`: `op://...` is resolved with `op read --no-newline` (only when a new login is needed), anything else is used as is
+- With `client_id`: `_gdrive_login` runs the OAuth2 loopback flow with PKCE (`http.server` on `127.0.0.1:0`, state check, 5 min timeout, Ctrl-C cancels), `access_type=online` (~1h token, no refresh token); token exchange/revoke via plain `urllib`
 - Uses `google-api-python-client` Drive API v3
-- Caches folder ID lookups in `_id_cache` (path -> ID mapping)
+- Empty `folder` -> virtual root (`GItem.virtual`): `My Drive` (id `root`), `Shared with me` (`sharedWithMe = true` query), `Shared drives` (`drives().list()`, drive ID used as folder ID). Virtual root/`Shared with me`/`Shared drives` are read-only (`_check_writable`)
+- Paths resolve by listing each parent (`_item()` -> `_children()`), cached in `_listing` (dir path -> {display name -> `GItem`}); `read_dir` always refreshes, writes/mkdir drop the parent listing
+- Duplicate names in a listing get ` (2)`, ` (3)`... before the extension, ordered by (name, createdTime, id) so they are stable (`_gdrive_unique_name`); `/` in names becomes `_`
+- Shortcuts resolve to `shortcutDetails.targetId`/`targetMimeType` in `_to_item`, so folder shortcuts are enterable
 - All API calls use `supportsAllDrives=True` and `includeItemsFromAllDrives=True` for shared/team drives
 
 ### DropboxFS
 
 - Dropbox VFS via the API (not the local sync folder), config extension `.dropbox`
 - Config keys: `type=dropbox`, `app_key` (required, Dropbox app with PKCE enabled), optional `root`, `account` (session name, default = config basename), `team=1` (Business team space via `with_path_root`)
-- Auth: OAuth2 PKCE copy-paste flow (`_dropbox_login`), no app secret, `token_access_type="online"` (short-lived ~4h access token, no refresh token); runs on the main screen (`curses.endwin()` + `input()`), then restores curses
-- Tokens are never written to disk: `DROPBOX_SESSIONS` (account -> `DropboxSession`) holds them in memory for the life of the process. `enter()` reuses a live session or logs in again; `DropboxFS._client()` raises "login expired; re-open the remote" once the session expired or was logged out
-- `dropbox_logout(account)` revokes via `auth_token_revoke()` and drops the session; the `r` remotes menu adds a `logout dropbox:<account>` item for each `.dropbox` remote with a live session
-- `App.action_dropbox_logout` also calls `Panel.leave_dropbox(account)` on both panels, unwinding the VFS stack back to the local FS the remote was opened from
-- `entry()` calls `dropbox_logout_all()` in `finally`, revoking live tokens on exit (5s timeout per revoke)
-- `display_path()` appends `DropboxSession.time_left()` to the label (`Dropbox 3h42m`); `App.run` uses a 30s `getch` timeout while any session is live so it keeps counting down
+- Auth: OAuth2 PKCE copy-paste flow (`_dropbox_login`), no app secret, `token_access_type="online"` (short-lived ~4h access token, no refresh token)
 - Uploads > 32 MB use upload sessions; paths are `"/" + root/path`, root itself is `""`
+
+### OAuth sessions (Dropbox, GDrive)
+
+- Tokens are never written to disk. `OAUTH_SESSIONS` maps `"kind:account"` to `OAuthSession` (token, expiry, `revoke` callable) for the life of the process; `VFS.session` points at it for OAuth-backed remotes
+- `oauth_session()` reuses a live session (dropping/revoking one that expired or has a different client id); `_MainScreen` wraps the browser login on the plain terminal (`curses.endwin()`), then restores curses
+- `DropboxFS._client()` / `GDriveFS._client()` raise "login expired; re-open the remote" once `session.live()` is false
+- `oauth_logout(key)` revokes and forgets; `App.action_oauth_logout` also calls `Panel.leave_session(key)` on both panels to unwind back to the local FS; the `r` remotes menu adds `logout <kind>:<account>` for each live session
+- `entry()` calls `oauth_logout_all()` in `finally` (revoke on exit, 5s timeout per call)
+- `display_path()` appends `session.time_left()` to the label (`Dropbox 3h42m`); `App.run` uses a 30s `getch` timeout while any session is live
+
+### Error messages
+
+- `error_text(e)` turns exceptions into short status-line text: Google `HttpError` -> `"<status>: <Google message>"`, Dropbox `ApiError` -> `user_message_text` or the union tag path (`dropbox: path/not_found`), anything else `str(e)`. Used by `Panel.report_error` and the `set_error(...)` exception sites; the log keeps the full exception.
 
 ### Screen switching
 
