@@ -2902,6 +2902,13 @@ class Panel:
         self.move_to(cur)
         self.offset = off
 
+    def select_name(self, name: str) -> bool:
+        for i, f in enumerate(self.files):
+            if f.name == name:
+                self.cursor = i
+                return True
+        return False
+
     def scroll(self, delta: int) -> None:
         self.offset += delta
         mx = len(self.files) - 1
@@ -4394,6 +4401,10 @@ class App:
                 except Exception as e:
                     self.set_error(error_text(e))
             p.reload()
+            # Point at the new dir (first component of a nested "a/b/c").
+            top = [c for c in name.split("/") if c and c != "."]
+            if top and not os.path.isabs(name):
+                p.select_name(top[0])
 
         self.show_prompt("mkdir: ", "", do_it)
 
