@@ -6779,6 +6779,11 @@ def main(stdscr: curses.window, dirs: list[str]) -> None:
                 "iproov",
                 lambda: app.action_chdir(os.path.join(home, "iproov")),
             ),
+            MenuItem(
+                "b",
+                "dropbox",
+                lambda: app.action_chdir(os.path.join(home, "Dropbox")),
+            ),
         ]
         + (
             [
