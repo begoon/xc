@@ -6,6 +6,19 @@ and this project loosely follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.42] - 2026-11-25
+
+### Added
+
+- `mkdir` puts the cursor on the new directory (the first part of a nested
+  path).
+- `b` `b` bookmark jumps to `~/Dropbox`.
+
+### Fixed
+
+- `Enter` after `/` quick search opens symlinks to directories (e.g.
+  `~/Dropbox`) instead of putting the name on the command line.
+
 ## [0.2.41] - 2026-11-24
 
 ### Changed
