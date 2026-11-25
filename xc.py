@@ -2902,6 +2902,12 @@ class Panel:
         self.move_to(cur)
         self.offset = off
 
+    def is_dir_link(self, f: VFile) -> bool:
+        if not f.is_symlink():
+            return False
+        dp = self.disk_path(f.name)
+        return bool(dp) and os.path.isdir(dp)
+
     def select_name(self, name: str) -> bool:
         for i, f in enumerate(self.files):
             if f.name == name:
@@ -6377,7 +6383,7 @@ class App:
             p = self.panels[self.active]
             f = p.selected_file()
             if f and f.name != "..":
-                if f.is_dir():
+                if f.is_dir() or p.is_dir_link(f):
                     p.enter()
                 else:
                     self.cmd_mode = 1
