@@ -6,6 +6,8 @@ and this project loosely follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.43] - 2026-11-25
+
 ### Added
 
 - Configurable `Enter` associations in `~/.xc/xc.conf` (JSON list of
