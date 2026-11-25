@@ -72,6 +72,13 @@ Detection is probe-based: iterate `probes` list, first match wins. Add new VFS t
 - `Panel.enter` on a non-local VFS (no `disk_path`) calls `enter_archive_copy()`: archive probes (TarFS/ZipFS/CompressedFS) are pre-checked by name, the file is downloaded via `fs.read_file` to a `tempfile.mkstemp` copy, and the archive VFS gets `owned_temp`
 - `VFS.release()` = `leave()` + delete `owned_temp`; all panel/app stack unwinds call `release()`. `TEMP_COPIES` tracks live copies and `remove_temp_copies()` runs in `entry()`'s `finally`
 
+### File associations
+
+- `Panel.enter` falls through to `find_association(f.ext())` after dirs, dir symlinks, executables and VFS probes; it calls `on_run` (= `App.run_assoc` -> `App.action_run(cmd, fire_and_forget)`), so `%F` on a non-local VFS goes through `_action_run_remote` (temp copy, upload back if changed)
+- `find_association`: `user_associations()` from `~/.xc/xc.conf` (JSON `{"associations": [{"ext": str|[str], "cmd": str, "pager": bool}]}`) first, then the built-in `ASSOCIATIONS` table; extensions normalized by `_norm_ext` (lowercase, leading dot)
+- `user_associations()` caches by (mtime_ns, size) in `_user_assoc_cache` and raises `OSError("xc.conf: ...")` on invalid content, reported via `Panel.report_error`
+- `pager` default false -> `Assoc.fire_and_forget=True` (run in the terminal, no `less`)
+
 ### Screen switching
 
 - App uses curses alternate screen; external commands run on the main screen so output stays in scroll buffer

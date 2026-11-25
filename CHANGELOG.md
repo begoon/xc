@@ -6,6 +6,13 @@ and this project loosely follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Configurable `Enter` associations in `~/.xc/xc.conf` (JSON list of
+  `{"ext", "cmd", "pager"}`), checked after built-in behaviour and before the
+  built-in associations. Commands use the usual macros, and `%F` on a remote
+  VFS uses a temporary local copy.
+
 ## [0.2.42] - 2026-11-25
 
 ### Added

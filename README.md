@@ -98,22 +98,22 @@ On first launch, the active panel opens in the current working directory and the
 
 ### Navigation
 
-| Key                  | Action                                 |
-| -------------------- | -------------------------------------- |
-| `Up` / `Ctrl-P`      | Move cursor up                         |
-| `Down` / `j`         | Move cursor down                       |
-| `Enter`              | Enter directory or open VFS            |
-| `Backspace`          | Go to parent directory (or exit VFS)   |
-| `Left` / `Right`     | Page up / page down                    |
-| `PgUp` / `PgDn`      | Page up / page down                    |
-| `Home` / `^`         | Jump to first file                     |
-| `End` / `G`          | Jump to last file                      |
-| `Ctrl-D` / `Ctrl-U`  | Half-page down / up                    |
-| `Ctrl-L`             | Reload current directory               |
-| `Tab`                | Switch active panel                    |
-| `=`                  | Open active directory in other panel   |
-| `h` / `l`            | Activate left / right panel            |
-| `q`                  | Quit                                   |
+| Key                 | Action                                       |
+| ------------------- | -------------------------------------------- |
+| `Up` / `Ctrl-P`     | Move cursor up                               |
+| `Down` / `j`        | Move cursor down                             |
+| `Enter`             | Enter directory, open VFS or run association |
+| `Backspace`         | Go to parent directory (or exit VFS)         |
+| `Left` / `Right`    | Page up / page down                          |
+| `PgUp` / `PgDn`     | Page up / page down                          |
+| `Home` / `^`        | Jump to first file                           |
+| `End` / `G`         | Jump to last file                            |
+| `Ctrl-D` / `Ctrl-U` | Half-page down / up                          |
+| `Ctrl-L`            | Reload current directory                     |
+| `Tab`               | Switch active panel                          |
+| `=`                 | Open active directory in other panel         |
+| `h` / `l`           | Activate left / right panel                  |
+| `q`                 | Quit                                         |
 
 ### File operations (`x`)
 
@@ -210,6 +210,36 @@ Example setup:
 ### Editor (`e`) and view (`v`)
 
 Press `e` to open a file in an editor, or `v` to view it. These menus launch external commands with the current file path substituted via macros (see below). On remote VFS (SSH, S3, GCS, OCI, GDrive), the file is automatically downloaded to a temp location, opened locally, and uploaded back if modified.
+
+### File associations (`Enter`)
+
+`Enter` on a file goes through these steps, first match wins:
+
+1. Built-in behaviour: directories (and symlinks to them), executables, and virtual filesystems (archives, Office files as zip, `.s3`/`.gdrive`/`.dropbox`/... configs).
+2. Your associations from `~/.xc/xc.conf`.
+3. Built-in associations: on macOS `.jpeg .jpg .png .mov .mp4 .pdf` run `open %f`; on macOS and Linux `.json` runs `cat %f | jq`.
+
+`~/.xc/xc.conf` is a JSON file:
+
+```json
+{
+  "associations": [
+    {
+      "ext": [".rk", ".rkr", ".rks", ".pki", ".gam"],
+      "cmd": "bunx rk86@latest --online %F"
+    },
+    { "ext": "csv", "cmd": "column -s, -t < %F", "pager": true }
+  ]
+}
+```
+
+| Key     | Description                                                                                          |
+| ------- | ---------------------------------------------------------------------------------------------------- |
+| `ext`   | Extension or list of extensions; case-insensitive, the leading dot is optional                       |
+| `cmd`   | Command to run, with [macros](#macros) (`%F` full path, `%f` name, `%x` name without extension, ...) |
+| `pager` | `true` pipes the output through `less` like `:`; default `false` runs it in the terminal like `;`    |
+
+Entries are checked top to bottom, so a configured extension also overrides a built-in association (e.g. your own `.pdf` viewer). xc re-reads the file when it changes, so no restart is needed; an invalid file is reported in the status line. On a remote VFS, `%F` is a temporary local copy that is uploaded back if the command changes it (see [Remote file editing](#remote-file-editing)).
 
 ### Running shell commands
 

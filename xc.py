@@ -306,6 +306,86 @@ if sys.platform == "darwin" or sys.platform.startswith("linux"):
     ASSOCIATIONS[".json"] = Assoc(cmd="cat %f | jq")
 
 
+# User associations from ~/.xc/xc.conf, re-read when the file changes:
+# (mtime_ns, size) -> list of (extensions, Assoc).
+_user_assoc_cache: (
+    tuple[tuple[int, int], list[tuple[set[str], Assoc]]] | None
+) = None
+
+
+def _norm_ext(ext: str) -> str:
+    ext = ext.strip().lower()
+    if ext and not ext.startswith("."):
+        ext = "." + ext
+    return ext
+
+
+def user_associations() -> list[tuple[set[str], Assoc]]:
+    """Associations from the ``associations`` list in ``~/.xc/xc.conf``.
+
+    Each entry is ``{"ext": str | [str], "cmd": str, "pager": bool}``.
+    Raises OSError with a short message when the file is invalid.
+    """
+    global _user_assoc_cache
+    path = Path.home() / ".xc" / "xc.conf"
+    try:
+        st = path.stat()
+    except OSError:
+        _user_assoc_cache = None
+        return []
+    stamp = (st.st_mtime_ns, st.st_size)
+    if _user_assoc_cache is not None and _user_assoc_cache[0] == stamp:
+        return _user_assoc_cache[1]
+    try:
+        conf = json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        raise OSError(f"xc.conf: {e}") from e
+    items = conf.get("associations", []) if isinstance(conf, dict) else None
+    if not isinstance(items, list):
+        raise OSError("xc.conf: 'associations' must be a list")
+    result: list[tuple[set[str], Assoc]] = []
+    for n, item in enumerate(items, 1):
+        if not isinstance(item, dict):
+            raise OSError(f"xc.conf: association #{n} must be an object")
+        exts = item.get("ext")
+        if isinstance(exts, str):
+            exts = [exts]
+        cmd = item.get("cmd")
+        if (
+            not isinstance(exts, list)
+            or not exts
+            or not all(isinstance(e, str) and e.strip() for e in exts)
+        ):
+            raise OSError(
+                f"xc.conf: association #{n}: 'ext' must be a string or list"
+            )
+        if not isinstance(cmd, str) or not cmd.strip():
+            raise OSError(f"xc.conf: association #{n}: 'cmd' must be a string")
+        pager = item.get("pager", False)
+        if not isinstance(pager, bool):
+            raise OSError(
+                f"xc.conf: association #{n}: 'pager' must be true/false"
+            )
+        assoc = Assoc(cmd=cmd.strip(), fire_and_forget=not pager)
+        result.append(({_norm_ext(e) for e in exts}, assoc))
+    _user_assoc_cache = (stamp, result)
+    return result
+
+
+def find_association(ext: str) -> Assoc | None:
+    """xc.conf associations first, then the built-in ASSOCIATIONS table.
+
+    Raises OSError when xc.conf is invalid (built-ins are not consulted).
+    """
+    ext = _norm_ext(ext)
+    if not ext:
+        return None
+    for exts, assoc in user_associations():
+        if ext in exts:
+            return assoc
+    return ASSOCIATIONS.get(ext)
+
+
 @dataclass
 class FileMetadata:
     mode: int | None = None
@@ -2692,7 +2772,8 @@ class Panel:
                 return
         full_path = self.disk_path(f.name)
         if not full_path:
-            self.enter_archive_copy(f)
+            if not self.enter_archive_copy(f):
+                self.run_association(f)
             return
         header = read_header(full_path, 32)
         for probe in self.probes:
@@ -2718,15 +2799,24 @@ class Panel:
             self.offset = 0
             self.load_dir()
             return
-        ext = f.ext().lower()
-        if ext and ext in ASSOCIATIONS and self.on_run:
-            assoc = ASSOCIATIONS[ext]
+        self.run_association(f)
+
+    def run_association(self, f: VFile) -> None:
+        if not self.on_run:
+            return
+        try:
+            assoc = find_association(f.ext())
+        except OSError as e:
+            self.report_error(e)
+            return
+        if assoc:
             self.on_run(assoc.cmd, assoc.fire_and_forget)
 
-    def enter_archive_copy(self, f: VFile) -> None:
+    def enter_archive_copy(self, f: VFile) -> bool:
         """Open an archive stored in a non-local VFS from a temp copy.
 
         The copy is owned by the archive VFS and deleted when it is left.
+        Returns False when the file is not an archive (nothing reported).
         """
         archive_types = (TarFS, ZipFS, CompressedFS)
         probes = [
@@ -2735,7 +2825,7 @@ class Panel:
             if isinstance(p, archive_types) and p.probe(ZIP_MAGIC, f.name)
         ]
         if not probes:
-            return
+            return False
         src = self.vfs_path(f.name)
         fd, tmp = tempfile.mkstemp(prefix="xc-", suffix="-" + f.name)
         TEMP_COPIES.add(tmp)
@@ -2765,9 +2855,10 @@ class Panel:
                 self.cursor = 0
                 self.offset = 0
                 self.load_dir()
-                return
+                return True
         except Exception as e:
             self.report_error(e)
+            return True
         finally:
             if not owned:
                 TEMP_COPIES.discard(tmp)
@@ -2775,6 +2866,7 @@ class Panel:
                     os.unlink(tmp)
                 except OSError:
                     pass
+        return False
 
     def enter_remote(self, path: str) -> None:
         header = read_header(path, 32)
@@ -4586,26 +4678,25 @@ class App:
         self.add_menu("remote", items)
         self.menu_selector("remote")
 
-    def action_run(self, cmd: str) -> None:
+    def action_run(self, cmd: str, fire_and_forget: bool = False) -> None:
         p = self.panels[self.active]
         f = p.selected_file()
         is_remote = not isinstance(p.fs, LocalFS) and f
         uses_F = "%F" in cmd or "%~F" in cmd or "%X" in cmd or "%~X" in cmd
 
         if is_remote and uses_F:
-            self._action_run_remote(cmd, p, f)
+            self._action_run_remote(cmd, p, f, fire_and_forget)
         else:
             expanded, background = self.expand_macro(cmd)
-            if background or is_interactive_cmd(expanded):
-                self.run_shell_cmd(expanded, True)
-            else:
-                self.run_shell_cmd(expanded, False)
+            fire = fire_and_forget or background or is_interactive_cmd(expanded)
+            self.run_shell_cmd(expanded, fire)
 
     def _action_run_remote(
         self,
         cmd: str,
         p: Panel,
         f: VFile,
+        fire_and_forget: bool = False,
     ) -> None:
         remote_path = p.vfs_path(f.name)
         _, ext = os.path.splitext(f.name)
@@ -4626,7 +4717,7 @@ class App:
 
             # expand macros with tmp_path standing in for %F
             expanded, background = self._expand_macro_with_path(cmd, tmp_path)
-            fire = background or is_interactive_cmd(expanded)
+            fire = fire_and_forget or background or is_interactive_cmd(expanded)
 
             curses.endwin()
             user_shell = os.environ.get("SHELL", "sh")
@@ -4764,10 +4855,8 @@ class App:
         p.reload()
 
     def run_assoc(self, cmd: str, fire_and_forget: bool) -> None:
-        expanded, bg = self.expand_macro(cmd)
-        if bg:
-            fire_and_forget = True
-        self.run_shell_cmd(expanded, fire_and_forget)
+        # Through action_run so %F on a remote file uses a temp copy.
+        self.action_run(cmd, fire_and_forget)
 
     def exec_command(self) -> None:
         cmd = "".join(self.cmd_line).strip()
