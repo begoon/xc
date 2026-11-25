@@ -109,6 +109,9 @@ class AppState:
     # Per-field input history, keyed by purpose (e.g. "copy.dst", "prompt.mkdir").
     input_history: dict[str, list[str]] = field(default_factory=dict)
     cmd_history: list[str] = field(default_factory=list)
+    # Per panel: name of the file under the cursor and the scroll offset.
+    cursors: list[str] = field(default_factory=lambda: ["", ""])
+    offsets: list[int] = field(default_factory=lambda: [0, 0])
 
 
 def load_state() -> AppState | None:
@@ -127,6 +130,13 @@ def load_state() -> AppState | None:
             if len(legacy) > 1 and legacy[1]:
                 st.input_history["copy.dst"] = legacy[1]
         st.cmd_history = data.get("cmd_history", [])
+        cursors = data.get("cursors", [])
+        offsets = data.get("offsets", [])
+        for side in (0, 1):
+            if side < len(cursors) and isinstance(cursors[side], str):
+                st.cursors[side] = cursors[side]
+            if side < len(offsets) and isinstance(offsets[side], int):
+                st.offsets[side] = max(0, offsets[side])
         return st
     except Exception:
         return None
@@ -142,6 +152,8 @@ def save_state(st: AppState) -> None:
                     "active": st.active,
                     "input_history": st.input_history,
                     "cmd_history": st.cmd_history,
+                    "cursors": st.cursors,
+                    "offsets": st.offsets,
                 },
                 indent=2,
             )
@@ -3000,6 +3012,25 @@ class Panel:
         dp = self.disk_path(f.name)
         return bool(dp) and os.path.isdir(dp)
 
+    def saved_place(self) -> tuple[str, str, int]:
+        """(local directory, file under the cursor, offset) for xc.json.
+
+        Inside a VFS this is the local directory it was entered from, with
+        the cursor on the archive/remote config file.
+        """
+        if self.stack:
+            base = self.stack[0]
+            return base.path, os.path.basename(base.entry_path), base.offset
+        f = self.selected_file()
+        return self.path, f.name if f else "", self.offset
+
+    def restore_place(self, name: str, offset: int) -> None:
+        if name and self.select_name(name):
+            # Keep the saved scroll position if the cursor is still on it;
+            # otherwise adjust_offset() scrolls it into view when drawn.
+            if offset <= self.cursor:
+                self.offset = offset
+
     def select_name(self, name: str) -> bool:
         for i, f in enumerate(self.files):
             if f.name == name:
@@ -3581,6 +3612,9 @@ class App:
             self.cmd_history = saved.cmd_history
             if saved.active in (0, 1):
                 self.active = saved.active
+            for side, p in enumerate(self.panels):
+                if saved.panels[side : side + 1] == [p.path]:
+                    p.restore_place(saved.cursors[side], saved.offsets[side])
 
     # -- Menus --
 
@@ -3927,11 +3961,14 @@ class App:
     # -- State --
 
     def do_save_state(self) -> None:
+        places = [p.saved_place() for p in self.panels]
         st = AppState(
-            panels=[self.panels[0].path, self.panels[1].path],
+            panels=[pl[0] for pl in places],
             active=self.active,
             input_history=self.input_history,
             cmd_history=self.cmd_history,
+            cursors=[pl[1] for pl in places],
+            offsets=[pl[2] for pl in places],
         )
         save_state(st)
 

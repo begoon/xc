@@ -182,5 +182,5 @@ uv run xc.py
 
 ## State
 
-App state saved to `~/.xc/xc.json` (panel paths, active panel, copy history).
+App state saved to `~/.xc/xc.json` (panel paths, cursor file names and offsets, active panel, input/command history). `Panel.saved_place()` returns the local dir (the bottom of the VFS stack when inside one) plus the file under the cursor; `App.__init__` calls `restore_place()` only when the panel opened at the saved path.
 Logs at `~/.xc/xc.log`.

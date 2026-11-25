@@ -12,6 +12,13 @@ and this project loosely follows [Semantic Versioning](https://semver.org/).
   `{"ext", "cmd", "pager"}`), checked after built-in behaviour and before the
   built-in associations. Commands use the usual macros, and `%F` on a remote
   VFS uses a temporary local copy.
+- The cursor position of both panels is saved on exit and restored on start.
+
+### Fixed
+
+- A panel inside an archive or remote at exit reopens in the local directory
+  it was entered from, with the cursor on that file, instead of falling back
+  to the start directory.
 
 ## [0.2.42] - 2026-11-25
 
