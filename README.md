@@ -144,7 +144,7 @@ Local moves use a filesystem rename when possible, preserving the original
 inode and its attributes. Cross-filesystem moves and directory merges use the
 metadata-preserving copy path, then delete only fully copied sources.
 
-TAR and Unix ZIP extraction preserves stored modes, modification times, and
+TAR, 7z and Unix ZIP extraction preserves stored modes, modification times, and
 symbolic links, for both individual and tagged entries. Archive ownership,
 ACLs, and extended attributes are not restored. Plain compressed files inherit
 the compressed file's permissions; gzip uses its stored timestamp when present.
@@ -372,6 +372,7 @@ Entering certain files opens them as virtual directories:
 | ------------------------------------------------- | ------- | --------------------------------------- |
 | `.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`             | TAR     | Browse tar archives                     |
 | `.zip`                                            | ZIP     | Browse zip archives                     |
+| `.7z`                                             | 7Z      | Browse 7z archives (needs 7-Zip)        |
 | `.docx`, `.xlsx`, `.pptx`, `.odt`, `.ods`, `.odp` | ZIP     | Browse Office documents as zip archives |
 | `.gz`, `.bz2`, `.xz`, `.lzma`                     | \-      | View compressed single files            |
 | `.s3`                                             | S3      | Browse Amazon S3 buckets                |
@@ -381,7 +382,7 @@ Entering certain files opens them as virtual directories:
 | `.dropbox`                                        | Dropbox | Browse Dropbox via its API              |
 | `.ssh`                                            | SSH     | Browse remote servers over SSH          |
 
-Office documents (`.docx`, `.xlsx`, `.pptx` and OpenDocument `.odt`, `.ods`, `.odp`) are ZIP containers: `Enter` opens them like a zip archive to browse their XML, media and other parts (only if the file really is a ZIP; encrypted Office files are not). Archives (tar, zip, Office, `.gz`/`.bz2`/`.xz`) inside a remote such as Google Drive, Dropbox or SSH can be entered too: xc downloads a temporary copy, which is deleted when you leave the archive or exit xc.
+Office documents (`.docx`, `.xlsx`, `.pptx` and OpenDocument `.odt`, `.ods`, `.odp`) are ZIP containers: `Enter` opens them like a zip archive to browse their XML, media and other parts (only if the file really is a ZIP; encrypted Office files are not). 7z archives are read through the 7-Zip command line program (`7zz`, `7z` or `7za` on `PATH`, e.g. `brew install sevenzip` or `apt install 7zip`); without it `.7z` files fall through to the associations. Password-protected 7z archives are not supported. Archives (tar, zip, 7z, Office, `.gz`/`.bz2`/`.xz`) inside a remote such as Google Drive, Dropbox or SSH can be entered too: xc downloads a temporary copy, which is deleted when you leave the archive or exit xc.
 
 VFS config files (`.s3`, `.gcs`, `.oci`, `.gdrive`, `.dropbox`, `.ssh`) are simple `key=value` text files. The path header shows the VFS type, e.g. `~/servers/prod.ssh (SSH)`.
 

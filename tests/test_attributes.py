@@ -288,6 +288,116 @@ class AttributeTests(unittest.TestCase):
         )
         self.assertTrue((self.dst / "link").is_symlink())
 
+    def make_7z(self):
+        program = xc.sevenzip_program()
+        if not program:
+            self.skipTest("7-Zip program not installed")
+        src = self.root / "7zsrc"
+        (src / "dir").mkdir(parents=True)
+        (src / "empty").mkdir()
+        (src / "executable").write_bytes(b"payload")
+        (src / "private").write_bytes(b"secret!")
+        (src / "dir" / "[x]*.txt").write_bytes(b"wild")
+        (src / "-dash").write_bytes(b"dash")
+        (src / "link").symlink_to("private")
+        os.chmod(src / "executable", 0o755)
+        os.chmod(src / "private", 0o600)
+        for path in src.rglob("*"):
+            os.utime(path, (946684800, 946684800), follow_symlinks=False)
+        os.chmod(src / "empty", 0o500)
+        archive = self.root / "test.7z"
+        subprocess.run(
+            [program, "a", "-snl", str(archive), "."],
+            cwd=src,
+            check=True,
+            capture_output=True,
+        )
+        self.assertTrue(xc.SevenZipFS().probe(b"", "TEST.7Z"))
+        self.assertTrue(xc.SevenZipFS().probe(xc.SEVENZIP_MAGIC, "noext"))
+        fs = xc.SevenZipFS().enter(b"", str(archive))
+        self.addCleanup(fs.leave)
+        return fs
+
+    def test_7z_listing(self):
+        fs = self.make_7z()
+        files = {f.name: f for f in fs.read_dir("")}
+        self.assertEqual(
+            set(files),
+            {"dir", "empty", "executable", "private", "-dash", "link"},
+        )
+        self.assertTrue(files["dir"].is_dir())
+        self.assertEqual(files["link"].link_target, "private")
+        self.assertEqual(files["executable"].mode, 0o755)
+        self.assertEqual(files["private"].size, 7)
+        self.assertEqual([f.name for f in fs.read_dir("dir")], ["[x]*.txt"])
+        self.assertEqual(fs.read_file("dir/[x]*.txt").read(), b"wild")
+        self.assertEqual(fs.read_file("-dash").read(), b"dash")
+        with self.assertRaises(OSError):
+            fs.read_file("missing")
+        with self.assertRaises(OSError):
+            fs.write_file("new", io.BytesIO(b""))
+
+    def test_7z_single_and_batch(self):
+        for batch in (False, True):
+            with self.subTest(batch=batch):
+                fs = self.make_7z()
+                a = app(panel(fs, ""), panel(self.fs, self.dst))
+                names = ["executable", "private", "empty", "link", "dir"]
+                if batch:
+                    self.assertEqual(
+                        a._copy_tagged(names, str(self.dst)), names, a.err_msg
+                    )
+                else:
+                    for name in names:
+                        self.assertTrue(
+                            a.do_copy(name, str(self.dst)), a.err_msg
+                        )
+                for name, mode in [
+                    ("executable", 0o755),
+                    ("private", 0o600),
+                    ("empty", 0o500),
+                ]:
+                    self.assertEqual(
+                        stat.S_IMODE((self.dst / name).stat().st_mode), mode
+                    )
+                    self.assertEqual(
+                        int((self.dst / name).stat().st_mtime), 946684800
+                    )
+                self.assertEqual(
+                    (self.dst / "private").read_bytes(), b"secret!"
+                )
+                self.assertEqual(
+                    (self.dst / "dir" / "[x]*.txt").read_bytes(), b"wild"
+                )
+                self.assertEqual(os.readlink(self.dst / "link"), "private")
+                os.chmod(self.dst / "empty", 0o700)
+                shutil.rmtree(self.dst)
+                self.dst.mkdir()
+                shutil.rmtree(self.root / "7zsrc")
+                os.remove(self.root / "test.7z")
+
+    def test_7z_encrypted_headers_reported(self):
+        program = xc.sevenzip_program()
+        if not program:
+            self.skipTest("7-Zip program not installed")
+        (self.src / "f").write_bytes(b"x")
+        archive = self.root / "enc.7z"
+        subprocess.run(
+            [program, "a", "-psecret", "-mhe=on", str(archive), "f"],
+            cwd=self.src,
+            check=True,
+            capture_output=True,
+        )
+        with self.assertRaisesRegex(OSError, "encrypted"):
+            xc.SevenZipFS().enter(b"", str(archive))
+
+    def test_parse_unix_mode(self):
+        self.assertEqual(
+            xc.parse_unix_mode("-rwsr-Sr-t"), stat.S_IFREG | 0o7745
+        )
+        self.assertEqual(xc.parse_unix_mode("drwx------"), stat.S_IFDIR | 0o700)
+        self.assertIsNone(xc.parse_unix_mode("A"))
+
     def test_gzip_metadata(self):
         archive = self.root / "file.gz"
         with archive.open("wb") as out:

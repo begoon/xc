@@ -6,6 +6,13 @@ and this project loosely follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `.7z` archives open as a read-only VFS through the 7-Zip command line
+  program (`7zz`, `7z` or `7za`), also from remotes. Modes, modification
+  times and symlinks are preserved on copy, and tagged files are extracted in
+  one 7-Zip run. Password-protected archives are reported as unsupported.
+
 ## [0.2.43] - 2026-11-25
 
 ### Added

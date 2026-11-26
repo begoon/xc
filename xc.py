@@ -787,6 +787,10 @@ class TarFS(VFS):
             link_target=member.linkname if member.issym() else None,
         )
 
+    def file_paths(self) -> list[str]:
+        """Regular file paths in the archive."""
+        return [path for path, m in self._members.items() if m.isfile()]
+
     def read_files(self, paths: set[str]) -> dict[str, io.BytesIO]:
         """Extract multiple files in one sequential pass (no repeated decompression)."""
         result: dict[str, io.BytesIO] = {}
@@ -969,6 +973,362 @@ class ZipFS(VFS):
         self.dirs = None
         self.archive_path = ""
         self._infos = {}
+
+
+SEVENZIP_MAGIC = b"7z\xbc\xaf\x27\x1c"
+SEVENZIP_PROGRAMS = ("7zz", "7z", "7za")
+
+
+def sevenzip_program() -> str | None:
+    """Path of the first 7-Zip command line program found on PATH."""
+    for name in SEVENZIP_PROGRAMS:
+        path = shutil.which(name)
+        if path:
+            return path
+    return None
+
+
+def parse_unix_mode(text: str) -> int | None:
+    """Turn an `ls -l` style mode (`-rwxr-xr-x`) into a st_mode value."""
+    if len(text) != 10:
+        return None
+    kinds = {
+        "-": stat.S_IFREG,
+        "d": stat.S_IFDIR,
+        "l": stat.S_IFLNK,
+        "b": stat.S_IFBLK,
+        "c": stat.S_IFCHR,
+        "p": stat.S_IFIFO,
+        "s": stat.S_IFSOCK,
+    }
+    if text[0] not in kinds:
+        return None
+    mode = kinds[text[0]]
+    bits = (
+        (stat.S_IRUSR, stat.S_IWUSR, stat.S_IXUSR, stat.S_ISUID),
+        (stat.S_IRGRP, stat.S_IWGRP, stat.S_IXGRP, stat.S_ISGID),
+        (stat.S_IROTH, stat.S_IWOTH, stat.S_IXOTH, stat.S_ISVTX),
+    )
+    for i, (r, w, x, special) in enumerate(bits):
+        part = text[1 + i * 3 : 4 + i * 3]
+        if part[0] == "r":
+            mode |= r
+        elif part[0] != "-":
+            return None
+        if part[1] == "w":
+            mode |= w
+        elif part[1] != "-":
+            return None
+        if part[2] == "x":
+            mode |= x
+        elif part[2] in "sStT":
+            mode |= special | (x if part[2] in "st" else 0)
+        elif part[2] != "-":
+            return None
+    return mode
+
+
+@dataclass
+class SevenZipEntry:
+    path: str
+    size: int = 0
+    mtime: float = 0.0
+    unix_mode: int = 0  # full st_mode, 0 when the archive has none
+    is_dir: bool = False
+    encrypted: bool = False
+
+    @property
+    def is_symlink(self) -> bool:
+        return stat.S_ISLNK(self.unix_mode)
+
+
+def parse_7z_listing(text: str) -> list[SevenZipEntry]:
+    """Parse `7z l -slt -ba` output (blank-line separated `Key = value`)."""
+    entries: list[SevenZipEntry] = []
+    for block in text.split("\n\n"):
+        fields: dict[str, str] = {}
+        for line in block.splitlines():
+            key, sep, value = line.partition(" = ")
+            if not sep:
+                key, sep, value = line.partition(" =")
+            if sep:
+                fields[key.strip()] = value
+        if "Path" not in fields:
+            continue
+        entry = SevenZipEntry(path=fields["Path"])
+        try:
+            entry.size = int(fields.get("Size") or 0)
+        except ValueError:
+            pass
+        modified = (fields.get("Modified") or "").strip()
+        if modified:
+            date, _, frac = modified.partition(".")
+            try:
+                entry.mtime = datetime.strptime(
+                    date, "%Y-%m-%d %H:%M:%S"
+                ).timestamp() + (float("0." + frac) if frac.isdigit() else 0)
+            except (ValueError, OSError):
+                pass
+        attrs = (fields.get("Attributes") or "").split()
+        for token in attrs[1:] or attrs:
+            mode = parse_unix_mode(token)
+            if mode is not None:
+                entry.unix_mode = mode
+                break
+        entry.is_dir = (
+            (bool(attrs) and "D" in attrs[0])
+            or fields.get("Folder") == "+"
+            or stat.S_ISDIR(entry.unix_mode)
+        )
+        entry.encrypted = fields.get("Encrypted") == "+"
+        entries.append(entry)
+    return entries
+
+
+class SevenZipFS(VFS):
+    """Read-only 7z archives through the 7-Zip command line program.
+
+    Listing uses `l -slt -ba`; files are streamed with `e -so`. `-spd`
+    turns off wildcard matching so names are taken literally, and an
+    empty `-p` keeps 7-Zip from prompting for a password on the terminal.
+    """
+
+    label = "7Z"
+
+    def __init__(self) -> None:
+        self.dirs: dict[str, list[VFile]] | None = None
+        self.archive_path: str = ""
+        self.program: str = ""
+        self._entries: dict[str, SevenZipEntry] = {}
+        self._order: list[SevenZipEntry] = []  # archive order, all entries
+        self._batch_data: dict[str, io.BytesIO] = {}
+
+    def probe(self, header: bytes, filename: str) -> bool:
+        if not (
+            filename.lower().endswith(".7z")
+            or header.startswith(SEVENZIP_MAGIC)
+        ):
+            return False
+        return sevenzip_program() is not None
+
+    def _run(self, args: list[str], what: str) -> bytes:
+        try:
+            proc = subprocess.run(
+                [self.program, *args],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+            )
+        except OSError as e:
+            raise OSError(f"7-Zip: {e}") from e
+        if proc.returncode != 0:
+            lines = [
+                line.strip()
+                for line in proc.stderr.decode(errors="replace").splitlines()
+                if line.strip()
+            ]
+            detail = next(
+                (line for line in lines if line.startswith("ERROR")),
+                lines[0] if lines else f"exit code {proc.returncode}",
+            )
+            if "password" in detail.lower():
+                detail = "encrypted archives are not supported"
+            raise OSError(f"7-Zip cannot {what}: {detail}")
+        return proc.stdout
+
+    def enter(self, header: bytes, filename: str, cwd: str = "") -> VFS:
+        new_fs = SevenZipFS()
+        new_fs.program = sevenzip_program() or ""
+        if not new_fs.program:
+            raise OSError("7-Zip program (7zz, 7z or 7za) not found")
+        new_fs.archive_path = filename
+        out = new_fs._run(
+            ["l", "-slt", "-ba", "-p", "--", filename], "list archive"
+        )
+        listing = parse_7z_listing(
+            out.decode("utf-8", errors="surrogateescape")
+        )
+        dirs: dict[str, list[VFile]] = {"": []}
+        seen: set[str] = set()
+        entries: dict[str, SevenZipEntry] = {}
+        order: list[SevenZipEntry] = []
+
+        def ensure_dir_chain(dir_path: str) -> None:
+            if not dir_path:
+                return
+            parent = os.path.dirname(dir_path)
+            base = os.path.basename(dir_path)
+            key = parent + "\x00" + base
+            if key in seen:
+                return
+            seen.add(key)
+            ensure_dir_chain(parent)
+            dirs.setdefault(parent, []).append(
+                VFile(name=base, file_type=FILE_TYPE_DIR)
+            )
+
+        for entry in listing:
+            name = os.path.normpath(entry.path.replace("\\", "/"))
+            if name in (".", ""):
+                continue
+            if os.path.isabs(name) or name == ".." or name.startswith("../"):
+                raise OSError(f"unsafe archive path: {entry.path}")
+            order.append(entry)
+            d = os.path.dirname(name)
+            base = os.path.basename(name)
+            if entry.is_dir:
+                dirs.setdefault(name, [])
+            key = d + "\x00" + base
+            if key in seen:
+                continue
+            seen.add(key)
+            entries[name] = entry
+            ensure_dir_chain(d)
+            perm = stat.S_IMODE(entry.unix_mode) if entry.unix_mode else None
+            dirs.setdefault(d, []).append(
+                VFile(
+                    name=base,
+                    size=0 if entry.is_dir else entry.size,
+                    file_type=(
+                        FILE_TYPE_DIR
+                        if entry.is_dir
+                        else (
+                            FILE_TYPE_SYMLINK
+                            if entry.is_symlink
+                            else FILE_TYPE_FILE
+                        )
+                    ),
+                    mod_time=entry.mtime,
+                    mode=perm,
+                    executable=bool(perm and perm & 0o111),
+                )
+            )
+        new_fs._entries = entries
+        new_fs._order = order
+
+        links = {
+            path
+            for path, entry in entries.items()
+            if entry.is_symlink and not entry.encrypted
+        }
+        targets: dict[str, io.BytesIO] = {}
+        if links:
+            try:
+                targets = new_fs.read_files(links)
+            except OSError as e:
+                log.warning("7z: cannot read symlink targets: %s", e)
+        for d, files in dirs.items():
+            for vf in files:
+                path = f"{d}/{vf.name}" if d else vf.name
+                if path in targets:
+                    vf.link_target = os.fsdecode(targets[path].getvalue())
+            dirs[d] = sort_files(files)
+        new_fs.dirs = dirs
+        return new_fs
+
+    def read_dir(self, path: str) -> list[VFile]:
+        if self.dirs is None:
+            raise OSError("7z not opened")
+        if path not in self.dirs:
+            raise OSError(f"directory not found in archive: {path}")
+        return self.dirs[path]
+
+    def _check_readable(self, path: str) -> SevenZipEntry:
+        entry = self._entries.get(path)
+        if entry is None or entry.is_dir:
+            raise OSError(f"file not found in archive: {path}")
+        if entry.encrypted:
+            raise OSError(f"encrypted archive entry not supported: {path}")
+        return entry
+
+    def read_file(self, path: str) -> io.IOBase:
+        if path in self._batch_data:
+            return io.BytesIO(self._batch_data[path].getvalue())
+        entry = self._check_readable(path)
+        data = self._run(
+            ["e", "-so", "-spd", "-p", "--", self.archive_path, entry.path],
+            f"read {path}",
+        )
+        if len(data) != entry.size:
+            raise OSError(f"7-Zip returned a short read for {path}")
+        return io.BytesIO(data)
+
+    def file_paths(self) -> list[str]:
+        """Regular (non-directory, non-symlink) file paths in the archive."""
+        return [
+            path
+            for path, entry in self._entries.items()
+            if not entry.is_dir and not entry.is_symlink
+        ]
+
+    def read_files(self, paths: set[str]) -> dict[str, io.BytesIO]:
+        """Extract several files with one 7-Zip run.
+
+        Each solid block is decompressed once. `e -so` writes the selected
+        files back to back in archive order, so the stream is split by the
+        sizes from the listing.
+        """
+        wanted = {self._check_readable(p).path: p for p in paths}
+        if not wanted:
+            return {}
+        selected = [e for e in self._order if e.path in wanted and not e.is_dir]
+        fd, list_file = tempfile.mkstemp(prefix="xc-7z-", suffix=".txt")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                for name in wanted:
+                    f.write(name + "\n")
+            data = self._run(
+                [
+                    "e",
+                    "-so",
+                    "-spd",
+                    "-p",
+                    "-scsUTF-8",
+                    "-i@" + list_file,
+                    "--",
+                    self.archive_path,
+                ],
+                "extract files",
+            )
+        finally:
+            try:
+                os.unlink(list_file)
+            except OSError:
+                pass
+        if len(data) != sum(e.size for e in selected):
+            raise OSError("7-Zip returned unexpected data for tagged files")
+        result: dict[str, io.BytesIO] = {}
+        pos = 0
+        for entry in selected:
+            chunk = data[pos : pos + entry.size]
+            pos += entry.size
+            result[wanted[entry.path]] = io.BytesIO(chunk)
+        return result
+
+    def get_metadata(self, path: str) -> FileMetadata:
+        entry = self._entries.get(path)
+        if entry is None:
+            return FileMetadata()  # An implicit archive directory.
+        link_target = None
+        if entry.is_symlink:
+            link_target = os.fsdecode(self.read_file(path).read())
+        return FileMetadata(
+            mode=stat.S_IMODE(entry.unix_mode) if entry.unix_mode else None,
+            mtime_ns=int(entry.mtime * 1_000_000_000) if entry.mtime else None,
+            link_target=link_target,
+        )
+
+    def write_file(self, path: str, data: io.IOBase) -> None:
+        raise OSError("writing to 7z archives not supported")
+
+    def mkdir_all(self, path: str) -> None:
+        raise OSError("creating directories in 7z archives not supported")
+
+    def leave(self) -> None:
+        self.dirs = None
+        self.archive_path = ""
+        self._entries = {}
+        self._order = []
+        self._batch_data = {}
 
 
 class CompressedFS(VFS):
@@ -2830,7 +3190,7 @@ class Panel:
         The copy is owned by the archive VFS and deleted when it is left.
         Returns False when the file is not an archive (nothing reported).
         """
-        archive_types = (TarFS, ZipFS, CompressedFS)
+        archive_types = (TarFS, ZipFS, SevenZipFS, CompressedFS)
         probes = [
             p
             for p in self.probes
@@ -3579,6 +3939,7 @@ class App:
         probes: list[VFS] = [
             TarFS(),
             ZipFS(),
+            SevenZipFS(),
             CompressedFS(),
             S3FS(),
             GCSFS(),
@@ -4428,17 +4789,17 @@ class App:
         src_panel = self.panels[self.active]
         dst_panel = self.panels[1 - self.active]
         src_fs = src_panel.fs
-        # Prefetch regular TAR members in one pass, but use the same copy
+        # Prefetch regular TAR/7z members in one pass, but use the same copy
         # and metadata path as individual files (including links/directories).
-        if isinstance(src_fs, TarFS) and len(names) > 1:
+        batched = isinstance(src_fs, (TarFS, SevenZipFS))
+        if batched and len(names) > 1:
             paths = set()
             for name in names:
                 prefix = vfs_join(src_fs, src_panel.path, name)
                 paths.update(
                     path
-                    for path, member in src_fs._members.items()
-                    if member.isfile()
-                    and (path == prefix or path.startswith(prefix + "/"))
+                    for path in src_fs.file_paths()
+                    if path == prefix or path.startswith(prefix + "/")
                 )
             try:
                 src_fs._batch_data = src_fs.read_files(paths)
@@ -4454,7 +4815,7 @@ class App:
                     copied.append(name)
             return copied
         finally:
-            if isinstance(src_fs, TarFS):
+            if batched:
                 src_fs._batch_data = {}
 
     def do_delete(self, name: str) -> None:

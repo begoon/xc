@@ -8,7 +8,7 @@ Single-file Python two-panel file manager with virtual filesystem support.
 
 ## Architecture
 
-- **VFS layer**: Abstract `VFS` base class with implementations: `LocalFS`, `TarFS`, `S3FS`, `GCSFS`, `OCIFS`, `GDriveFS`, `DropboxFS`, `SSHFS`, `GrepFS`
+- **VFS layer**: Abstract `VFS` base class with implementations: `LocalFS`, `TarFS`, `ZipFS`, `SevenZipFS`, `CompressedFS`, `S3FS`, `GCSFS`, `OCIFS`, `GDriveFS`, `DropboxFS`, `SSHFS`, `GrepFS`
 - **Panel**: File list panel with VFS stack for nested navigation
 - **App**: Top-level curses app managing two panels, menus, commands, keymaps
 
@@ -66,10 +66,19 @@ Detection is probe-based: iterate `probes` list, first match wins. Add new VFS t
 
 - `error_text(e)` turns exceptions into short status-line text: Google `HttpError` -> `"<status>: <Google message>"`, Dropbox `ApiError` -> `user_message_text` or the union tag path (`dropbox: path/not_found`), anything else `str(e)`. Used by `Panel.report_error` and the `set_error(...)` exception sites; the log keeps the full exception.
 
+### SevenZipFS
+
+- Read-only `.7z` VFS (label `7Z`) that shells out to the first of `7zz`/`7z`/`7za` on `PATH` (`sevenzip_program()`); `probe` matches the `.7z` extension or `SEVENZIP_MAGIC`, and returns False when no program is installed (falls through to associations)
+- Listing: `l -slt -ba -p -- <archive>` parsed by `parse_7z_listing()` into `SevenZipEntry` (unix mode from the `Attributes` `ls`-style token via `parse_unix_mode()`, `D` attribute = dir, `Modified` is local time)
+- Every call passes `-p` (empty password) so 7-Zip never prompts on the terminal and `stdin=DEVNULL`; password errors become "encrypted archives are not supported"
+- `read_file`: `e -so -spd -p -- <archive> <path>`; `-spd` disables wildcards so names with `*`/`[` are literal. 7-Zip exits 0 for a missing name, so `_check_readable` checks `_entries` first and the output length is checked against `Size`
+- `read_files` (tagged copy batch, symlink targets on enter): one `e -so -spd -i@<listfile>` run; the output is the selected files back to back in archive order (`_order`) and is split by listed sizes
+- `_copy_tagged` batches any source with `file_paths()`/`read_files()`/`_batch_data` (`TarFS`, `SevenZipFS`)
+
 ### Archives in Office files and remotes
 
 - `ZipFS.probe` also accepts `ZipFS.OFFICE_EXTS` (`.docx .xlsx .pptx .odt .ods .odp`) when the header is `ZIP_MAGIC` (`PK\x03\x04`); encrypted (OLE) Office files fall through
-- `Panel.enter` on a non-local VFS (no `disk_path`) calls `enter_archive_copy()`: archive probes (TarFS/ZipFS/CompressedFS) are pre-checked by name, the file is downloaded via `fs.read_file` to a `tempfile.mkstemp` copy, and the archive VFS gets `owned_temp`
+- `Panel.enter` on a non-local VFS (no `disk_path`) calls `enter_archive_copy()`: archive probes (TarFS/ZipFS/SevenZipFS/CompressedFS) are pre-checked by name, the file is downloaded via `fs.read_file` to a `tempfile.mkstemp` copy, and the archive VFS gets `owned_temp`
 - `VFS.release()` = `leave()` + delete `owned_temp`; all panel/app stack unwinds call `release()`. `TEMP_COPIES` tracks live copies and `remove_temp_copies()` runs in `entry()`'s `finally`
 
 ### File associations
