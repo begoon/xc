@@ -96,3 +96,13 @@ publish:
     subprocess.run(["uv", "build"], check=True)
     subprocess.run(["op", "run", "--env-file=secrets.op", "--", "uv", "publish"], check=True)
     print(f"published {lv}")
+
+    tag = f"v{lv}"
+    subject = subprocess.run(
+        ["git", "log", "-1", "--format=%s"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    message = subject if subject.startswith(f"release: {lv}") else f"release: {lv}"
+    subprocess.run(["git", "tag", "-a", tag, "-m", message], check=True)
+    subprocess.run(["git", "push", "origin", tag], check=True)
+    print(f"tagged {tag}")
