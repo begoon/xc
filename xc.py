@@ -45,7 +45,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "0.2.43"
+VERSION = "0.2.44"
 
 # ---------------------------------------------------------------------------
 # Logging

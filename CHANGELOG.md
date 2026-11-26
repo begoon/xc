@@ -6,6 +6,8 @@ and this project loosely follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.44] - 2026-11-26
+
 ### Added
 
 - `.7z` archives open as a read-only VFS through the 7-Zip command line
