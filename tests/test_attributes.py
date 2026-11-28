@@ -35,6 +35,7 @@ def app(src, dst):
     a.overwrite_all = False
     a._ow_dir_cache = {}
     a.err_msg = ""
+    a.show_progress = lambda _: None
     a.progress = lambda _: False
     a.poll_cancel = lambda: False
     a.finish_op = lambda: None
@@ -263,6 +264,62 @@ class AttributeTests(unittest.TestCase):
                         (self.dst / name).stat().st_mtime, 946684800
                     )
                 self.assertTrue((self.dst / "link").is_symlink())
+
+    @unittest.skipUnless(
+        shutil.which("compress") and shutil.which("gzip"),
+        "UNIX compress and gzip are required",
+    )
+    def test_unix_compressed_tar_in_nested_archive(self):
+        tar_path = self.src / "test.tar"
+        payload = b"payload"
+        with tarfile.open(tar_path, "w") as tf:
+            member = tarfile.TarInfo("dir/file")
+            member.size = len(payload)
+            tf.addfile(member, io.BytesIO(payload))
+        subprocess.run(["compress", "-f", str(tar_path)], check=True)
+        outer = self.src / "outer.zip"
+        with zipfile.ZipFile(outer, "w") as zf:
+            zf.write(tar_path.with_suffix(".tar.Z"), "test.taz")
+
+        errors = []
+        messages = []
+        p = xc.Panel(
+            str(self.src),
+            self.fs,
+            [xc.TarFS(), xc.ZipFS()],
+            errors.append,
+            None,
+            on_progress=messages.append,
+        )
+        p.cursor = next(
+            i for i, f in enumerate(p.files) if f.name == outer.name
+        )
+        p.enter()
+        p.cursor = 1
+        p.enter()
+        self.assertIsInstance(p.fs, xc.TarFS, errors)
+        self.assertEqual(
+            messages,
+            [
+                "Opening outer.zip...",
+                "Reading test.taz...",
+                "Opening test.taz...",
+            ],
+        )
+        fs = p.fs
+        self.addCleanup(fs.release)
+        self.assertEqual([f.name for f in p.files], ["..", "dir"])
+        with fs.read_file("dir/file") as f:
+            self.assertEqual(f.read(), payload)
+        self.assertEqual(
+            fs.read_files({"dir/file"})["dir/file"].read(), payload
+        )
+        copies = [Path(fs.archive_path), Path(fs.owned_temp)]
+        self.assertTrue(all(path.exists() for path in copies))
+        p.go_up()
+        self.assertIsInstance(p.fs, xc.ZipFS)
+        self.assertFalse(any(path.exists() for path in copies))
+        self.assertFalse(errors)
 
     def test_zip_unix_permissions_and_symlink(self):
         archive = self.root / "test.zip"

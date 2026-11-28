@@ -371,6 +371,7 @@ Entering certain files opens them as virtual directories:
 | Extension                                         | VFS     | Description                             |
 | ------------------------------------------------- | ------- | --------------------------------------- |
 | `.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`             | TAR     | Browse tar archives                     |
+| `.tar.Z`, `.taz`                                  | TAR     | Browse UNIX-compressed tar archives (needs `gzip`) |
 | `.zip`                                            | ZIP     | Browse zip archives                     |
 | `.7z`                                             | 7Z      | Browse 7z archives (needs 7-Zip)        |
 | `.docx`, `.xlsx`, `.pptx`, `.odt`, `.ods`, `.odp` | ZIP     | Browse Office documents as zip archives |

@@ -6,6 +6,14 @@ and this project loosely follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.45] - 2026-11-28
+
+### Added
+
+- Browse UNIX-compressed `.tar.Z` and `.taz` archives in the TAR VFS.
+- Show status messages while opening archives, reading selected archive files,
+  transferring remote files, and calculating directory sizes.
+
 ## [0.2.44] - 2026-11-26
 
 ### Added
@@ -278,7 +286,8 @@ accurately.
 - Install script issues.
 - Miscellaneous small fixes.
 
-[Unreleased]: https://github.com/begoon/xc/compare/v0.2.36...HEAD
+[Unreleased]: https://github.com/begoon/xc/compare/v0.2.45...HEAD
+[0.2.45]: https://github.com/begoon/xc/compare/v0.2.44...v0.2.45
 [0.2.36]: https://github.com/begoon/xc/compare/v0.2.35...v0.2.36
 [0.2.35]: https://github.com/begoon/xc/compare/v0.2.34...v0.2.35
 [0.2.34]: https://github.com/begoon/xc/compare/e8e84c9...v0.2.34

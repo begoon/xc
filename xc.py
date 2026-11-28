@@ -45,7 +45,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "0.2.44"
+VERSION = "0.2.45"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -493,7 +493,7 @@ def copy_local_metadata(
 
 
 ZIP_MAGIC = b"PK\x03\x04"
-# Temp copies of archives opened from non-local VFS; removed on exit.
+# Temp copies of downloaded or decompressed archives; removed on exit.
 TEMP_COPIES: set[str] = set()
 
 
@@ -640,12 +640,14 @@ class LocalFS(VFS):
 
 class TarFS(VFS):
     label = "TAR"
+    COMPRESS_EXTS = (".tar.z", ".taz")
 
     def __init__(self) -> None:
         self.dirs: dict[str, list[VFile]] | None = None
         self.archive_path: str = ""
         self.tar_mode: str = "r:"
         self.tf: tarfile.TarFile | None = None
+        self._decompressed_tar: str = ""
         self._members: dict[str, tarfile.TarInfo] = {}
         self._batch_data: dict[str, io.BytesIO] = {}
 
@@ -661,6 +663,7 @@ class TarFS(VFS):
                 ".tbz2",
                 ".tar.xz",
                 ".txz",
+                *self.COMPRESS_EXTS,
             )
         )
 
@@ -673,8 +676,44 @@ class TarFS(VFS):
             mode = "r:bz2"
         elif lower.endswith(".xz") or lower.endswith(".txz"):
             mode = "r:xz"
-        tf = tarfile.open(filename, mode)
-        dirs: dict[str, list[VFile]] = {}
+        new_fs = TarFS()
+        new_fs.archive_path = filename
+        new_fs.tar_mode = mode
+        try:
+            if lower.endswith(self.COMPRESS_EXTS):
+                new_fs.archive_path = new_fs._decompress(filename)
+                new_fs.tar_mode = "r:"
+            new_fs.tf = tarfile.open(new_fs.archive_path, new_fs.tar_mode)
+            new_fs._index(new_fs.tf)
+        except BaseException:
+            new_fs.leave()
+            raise
+        return new_fs
+
+    def _decompress(self, filename: str) -> str:
+        program = shutil.which("gzip")
+        if program is None:
+            raise OSError("opening UNIX-compressed TAR archives requires gzip")
+        with (
+            open(filename, "rb") as src,
+            tempfile.NamedTemporaryFile(
+                prefix="xc-", suffix=".tar", delete=False
+            ) as dst,
+        ):
+            self._decompressed_tar = dst.name
+            TEMP_COPIES.add(dst.name)
+            result = subprocess.run(
+                [program, "-dc"], stdin=src, stdout=dst, stderr=subprocess.PIPE
+            )
+            if result.returncode:
+                detail = result.stderr.decode(errors="replace").strip()
+                raise OSError(
+                    detail or "failed to decompress UNIX-compressed TAR"
+                )
+        return self._decompressed_tar
+
+    def _index(self, tf: tarfile.TarFile) -> None:
+        dirs: dict[str, list[VFile]] = {"": []}
         seen: set[str] = set()
         members: dict[str, tarfile.TarInfo] = {}
 
@@ -699,7 +738,6 @@ class TarFS(VFS):
             if name in (".", ""):
                 continue
             if os.path.isabs(name) or name == ".." or name.startswith("../"):
-                tf.close()
                 raise OSError(f"unsafe archive path: {member.name}")
             d = os.path.dirname(name)
             if d == ".":
@@ -734,13 +772,8 @@ class TarFS(VFS):
 
         for d in dirs:
             dirs[d] = sort_files(dirs[d])
-        new_fs = TarFS()
-        new_fs.dirs = dirs
-        new_fs.archive_path = filename
-        new_fs.tar_mode = mode
-        new_fs.tf = tf
-        new_fs._members = members
-        return new_fs
+        self.dirs = dirs
+        self._members = members
 
     def read_dir(self, path: str) -> list[VFile]:
         if self.dirs is None:
@@ -819,6 +852,13 @@ class TarFS(VFS):
         if self.tf is not None:
             self.tf.close()
             self.tf = None
+        if self._decompressed_tar:
+            try:
+                os.unlink(self._decompressed_tar)
+            except FileNotFoundError:
+                pass
+            TEMP_COPIES.discard(self._decompressed_tar)
+            self._decompressed_tar = ""
         self._members = {}
         self._batch_data = {}
         self.dirs = None
@@ -3053,6 +3093,7 @@ class Panel:
         on_error: Callable[[str], None],
         on_exec: Callable[[str], None],
         on_run: Callable[[str, bool], None] | None = None,
+        on_progress: Callable[[str], None] | None = None,
     ):
         self.path = path
         self.fs = fs
@@ -3060,6 +3101,7 @@ class Panel:
         self.on_error = on_error
         self.on_exec = on_exec
         self.on_run = on_run
+        self.on_progress = on_progress
         self.files: list[VFile] = []
         self.cursor = 0
         self.offset = 0
@@ -3072,6 +3114,10 @@ class Panel:
         log.error("panel error path=%s err=%s", self.path, err)
         if self.on_error:
             self.on_error(error_text(err))
+
+    def report_progress(self, message: str) -> None:
+        if self.on_progress:
+            self.on_progress(message)
 
     def load_dir(self) -> None:
         self.tagged = {}
@@ -3151,6 +3197,7 @@ class Panel:
         for probe in self.probes:
             if not probe.probe(header, f.name):
                 continue
+            self.report_progress(f"Opening {f.name}...")
             try:
                 new_fs = probe.enter(header, full_path, cwd=self.path)
             except Exception as e:
@@ -3199,6 +3246,10 @@ class Panel:
         if not probes:
             return False
         src = self.vfs_path(f.name)
+        verb = (
+            "Reading" if isinstance(self.fs, archive_types) else "Downloading"
+        )
+        self.report_progress(f"{verb} {f.name}...")
         fd, tmp = tempfile.mkstemp(prefix="xc-", suffix="-" + f.name)
         TEMP_COPIES.add(tmp)
         owned = False
@@ -3209,6 +3260,7 @@ class Panel:
             for probe in probes:
                 if not probe.probe(header, f.name):
                     continue
+                self.report_progress(f"Opening {f.name}...")
                 new_fs = probe.enter(header, tmp, cwd="")
                 new_fs.owned_temp = tmp
                 owned = True
@@ -3242,9 +3294,11 @@ class Panel:
 
     def enter_remote(self, path: str) -> None:
         header = read_header(path, 32)
+        name = os.path.basename(path)
         for probe in self.probes:
-            if not probe.probe(header, os.path.basename(path)):
+            if not probe.probe(header, name):
                 continue
+            self.report_progress(f"Opening {name}...")
             try:
                 new_fs = probe.enter(header, path, cwd=self.path)
             except Exception as e:
@@ -3801,6 +3855,8 @@ EXT_COLORS: dict[str, int] = {
     ".bz2": CP_EXT_ARCHIVE,
     ".xz": CP_EXT_ARCHIVE,
     ".lzma": CP_EXT_ARCHIVE,
+    ".z": CP_EXT_ARCHIVE,
+    ".taz": CP_EXT_ARCHIVE,
     ".mk": CP_EXT_GO,
     ".just": CP_EXT_GO,
 }
@@ -3957,6 +4013,7 @@ class App:
                 self.set_error,
                 lambda cmd: self.run_shell_cmd(cmd, False),
                 self.run_assoc,
+                on_progress=self.show_progress,
             ),
             Panel(
                 right_dir,
@@ -3965,6 +4022,7 @@ class App:
                 self.set_error,
                 lambda cmd: self.run_shell_cmd(cmd, False),
                 self.run_assoc,
+                on_progress=self.show_progress,
             ),
         ]
 
@@ -4286,12 +4344,15 @@ class App:
             log.info("status error: %s", msg)
         self.err_msg = msg
 
-    def progress(self, msg: str) -> bool:
-        """Show group-operation progress in the status line and return True
-        if the user pressed ESC to cancel."""
+    def show_progress(self, msg: str) -> None:
+        """Refresh the status line before a blocking operation."""
         h, w = self.scr.getmaxyx()
         self.draw_string(0, h - 3, " " + msg, w, curses.color_pair(CP_STATUS))
         self.scr.refresh()
+
+    def progress(self, msg: str) -> bool:
+        """Show progress and check for ESC between group operation steps."""
+        self.show_progress(msg)
         return self.poll_cancel()
 
     def poll_cancel(self) -> bool:
@@ -4793,6 +4854,8 @@ class App:
         # and metadata path as individual files (including links/directories).
         batched = isinstance(src_fs, (TarFS, SevenZipFS))
         if batched and len(names) > 1:
+            if self.progress("Reading selected archive files..."):
+                return []
             paths = set()
             for name in names:
                 prefix = vfs_join(src_fs, src_panel.path, name)
@@ -5098,6 +5161,7 @@ class App:
     ) -> None:
         remote_path = p.vfs_path(f.name)
         _, ext = os.path.splitext(f.name)
+        self.show_progress(f"Downloading {f.name}...")
         try:
             metadata = p.fs.get_metadata(remote_path)
             with p.fs.read_file(remote_path) as data:
@@ -5135,6 +5199,7 @@ class App:
                 )
                 mode_changed = after.st_mode != before.st_mode
                 if content_changed:
+                    self.show_progress(f"Uploading {f.name}...")
                     with open(tmp_path, "rb") as fh:
                         p.fs.write_file(remote_path, fh)
                 if (content_changed or mode_changed) and isinstance(
@@ -5286,6 +5351,7 @@ class App:
             dp = p.disk_path(f.name)
             if not dp:
                 return
+            self.show_progress(f"Calculating size of {f.name}...")
             p.dir_sizes[f.name] = calc_dir_size(dp)
 
         if p.tagged:
